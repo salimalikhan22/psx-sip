@@ -4,11 +4,11 @@
 Author: Salim Ali Khan · Version 1.0.0 · October 2026
 """
 
+from __future__ import annotations
+
 __version__ = "1.0.0"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
-
-from __future__ import annotations
 
 import os
 import sys
@@ -899,10 +899,20 @@ def print_etf_overview(df: pd.DataFrame, etf_symbol: str, meta: dict) -> None:
     )
 
 
+def _read_prompt_line(text: str) -> str:
+    """Read one line; use the controlling TTY when stdin is a pipe (curl | python -)."""
+    sys.stdout.write(text)
+    sys.stdout.flush()
+    if sys.stdin.isatty():
+        return sys.stdin.readline().strip()
+    with open("/dev/tty", encoding="utf-8") as tty:
+        return tty.readline().strip()
+
+
 def prompt(text: str) -> str:
     try:
-        return input(text).strip()
-    except (EOFError, KeyboardInterrupt):
+        return _read_prompt_line(text)
+    except (EOFError, KeyboardInterrupt, OSError):
         print("\nCancelled.")
         sys.exit(0)
 

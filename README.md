@@ -40,11 +40,13 @@ PSX_SIP_NO_PIP=1 python3 psx_sip_planner.py
 
 Replace `YOUR_USER` / `YOUR_REPO` / `BRANCH` with your repo after you push.
 
-**One-liner** (downloads script, installs deps if needed, runs interactively):
+**One-liner** (downloads script, installs deps if needed, runs interactively in a real terminal):
 
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/BRANCH/psx_sip_planner.py" | python3 -
 ```
+
+Prompts read from your terminal even though the script arrives on stdin (Linux/macOS/WSL).
 
 **Save locally then run** (recommended if you use it often):
 
