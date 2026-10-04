@@ -8,7 +8,7 @@ Interactive **Pakistan Stock Exchange (PSX)** tool:
 
 Data comes from [psxdata](https://pypi.org/project/psxdata/) (PSX Data Portal). Cache lives under `~/.psxdata/cache/` by default.
 
-**Author:** Salim Ali Khan · **Version:** 1.0.0 · **Date:** October 2026
+**Author:** Salim Ali Khan · **Version:** 1.0.1 · **Date:** October 2026
 
 ## Requirements
 
@@ -84,4 +84,11 @@ Then update the curl URL in this README to match your repo.
 |----------|--------|
 | `PSX_SIP_SKIP_BOOTSTRAP` | Do not attempt `pip install` |
 | `PSX_SIP_NO_PIP` | Exit with instructions if deps are missing |
+| `PSX_SIP_VERBOSE` | Show psxdata library warnings (OHLC/date cleanup on index history) |
+
+### Insights mode and psxdata warnings
+
+If you see lines like **Unknown PSX column header**, **OHLC constraint violated**, **Duplicate date(s)**, or **Dates are not in chronological order**, those come from the **psxdata** library while it scrapes PSX index history—not from a crash in this planner. PSX’s published index OHLC series often has duplicate dates, out-of-order rows, and occasional bad highs/lows; psxdata flags those rows and the planner drops flagged rows when computing period highs.
+
+As of **v1.0.1**, those messages are suppressed by default. Set `PSX_SIP_VERBOSE=1` to see them again (useful when debugging or reporting issues upstream to [psxdata](https://pypi.org/project/psxdata/)).
 # psx-sip

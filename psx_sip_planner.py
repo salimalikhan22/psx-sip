@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Interactive PSX index / ETF SIP planner and market insights using psxdata.
 
-Author: Salim Ali Khan · Version 1.0.0 · October 2026
+Author: Salim Ali Khan · Version 1.0.1 · October 2026
 """
 
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -65,6 +65,7 @@ def _bootstrap_dependencies() -> None:
 
 _bootstrap_dependencies()
 
+import logging
 import math
 import re
 from datetime import timedelta
@@ -72,10 +73,25 @@ from datetime import timedelta
 import pandas as pd
 import psxdata
 from bs4 import BeautifulSoup
-from psxdata.constants import BASE_URL, INDEX_NAMES
+from psxdata.constants import BASE_URL, COLUMN_MAP, INDEX_NAMES
 from psxdata.parsers.html import parse_html_table
 from psxdata.parsers.normalizers import coerce_numeric
 from psxdata.scrapers.base import BaseScraper
+
+
+def _configure_psxdata() -> None:
+    """Map newer PSX headers and hide expected psxdata warnings on noisy index history."""
+    # PSX /indices snapshot uses title case; psxdata 1.2.0 only maps "CHANGE".
+    COLUMN_MAP.setdefault("Change", "change")
+    if os.environ.get("PSX_SIP_VERBOSE", "").strip().lower() not in (
+        "1",
+        "yes",
+        "true",
+    ):
+        logging.getLogger("psxdata").setLevel(logging.ERROR)
+
+
+_configure_psxdata()
 
 BOARD_LOT = 500
 DEFAULT_COST_BUFFER_PCT = 0.5
