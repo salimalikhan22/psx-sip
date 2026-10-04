@@ -1,0 +1,8 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.csv
+psx-sip-portable.tar.gz
+psx-sip-portable.zip
+.DS_Store
