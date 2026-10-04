@@ -4,11 +4,11 @@ Interactive **Pakistan Stock Exchange (PSX)** tool:
 
 1. **Index SIP** — allocate a monthly amount across index constituents (weights, exclusions, board lots).
 2. **ETF SIP** — same for an ETF’s published creation-unit basket (with sector preview and ETF unit price).
-3. **Insights** — index/ETF levels, week/month/year highs, and sector leaders (no SIP plan).
+3. **Insights** — full snapshot, **multiple indices and/or ETFs** (not all), custom mix, or sectors only; then return to the main menu.
 
 Data comes from [psxdata](https://pypi.org/project/psxdata/) (PSX Data Portal). Cache lives under `~/.psxdata/cache/` by default.
 
-**Author:** Salim Ali Khan · **Version:** 1.0.1 · **Date:** October 2026
+**Author:** Salim Ali Khan · **Version:** 1.0.3 · **Date:** October 2026
 
 ## Requirements
 

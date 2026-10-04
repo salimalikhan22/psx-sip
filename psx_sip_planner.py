@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Interactive PSX index / ETF SIP planner and market insights using psxdata.
 
-Author: Salim Ali Khan · Version 1.0.1 · October 2026
+Author: Salim Ali Khan · Version 1.0.3 · October 2026
 """
 
 from __future__ import annotations
 
-__version__ = "1.0.1"
+__version__ = "1.0.3"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -638,37 +638,116 @@ def _print_sector_insights(
     )
 
 
-def run_insights_flow() -> None:
-    print("\nPSX Insights — indices, ETFs, and sectors (live PSX data)")
-    print("Fetching market snapshot and historical highs (this may take a minute)...\n")
-
+def _snapshot_by_symbol() -> dict[str, dict[str, float | None]]:
     snapshot_df = _fetch_indices_market_snapshot()
     snap_by_symbol: dict[str, dict[str, float | None]] = {}
-    if not snapshot_df.empty:
-        for _, row in snapshot_df.iterrows():
-            sym = str(row["symbol"]).upper()
-            snap_by_symbol[sym] = {
-                "current": row.get("current"),
-                "change_pct": row.get("change_pct"),
-                "high": row.get("high"),
-                "low": row.get("low"),
-            }
+    if snapshot_df.empty:
+        return snap_by_symbol
+    for _, row in snapshot_df.iterrows():
+        sym = str(row["symbol"]).upper()
+        snap_by_symbol[sym] = {
+            "current": row.get("current"),
+            "change_pct": row.get("change_pct"),
+            "high": row.get("high"),
+            "low": row.get("low"),
+        }
+    return snap_by_symbol
+
+
+def _insights_for_index(name: str, snap_by_symbol: dict[str, dict[str, float | None]]) -> dict:
+    print(f"  Index history: {name}...")
+    periods = _period_highs_from_ohlc(_historical_ohlc(name))
+    snap = snap_by_symbol.get(name, {})
+    return _insights_row(name, name, snap, periods)
+
+
+def _insights_for_etf(sym: str, label: str) -> dict:
+    print(f"  ETF history: {sym}...")
+    periods = _period_highs_from_ohlc(_historical_ohlc(sym))
+    return _insights_row(sym, label, {}, periods)
+
+
+def choose_insights_scope() -> str:
+    print("\nWhat insights do you want?\n")
+    print("  1. Full snapshot (all indices, all ETFs, sector pulse)")
+    print("  2. Selected PSX indices (one or more, not all)")
+    print("  3. Selected ETFs (one or more, not all)")
+    print("  4. Custom mix (any indices and/or ETFs you choose)")
+    print("  5. Sector pulse only (screener — no index/ETF history)")
+    print()
+    while True:
+        choice = prompt("Select [1]: ") or "1"
+        if choice in ("1", "full", "all", "a"):
+            return "full"
+        if choice in ("2", "index", "indices", "i"):
+            return "indices"
+        if choice in ("3", "etf", "etfs", "e"):
+            return "etfs"
+        if choice in ("4", "mix", "custom", "both", "m"):
+            return "mix"
+        if choice in ("5", "sectors", "sector", "s"):
+            return "sectors"
+        print("  Enter 1, 2, 3, 4, or 5.")
+
+
+def run_insights_flow() -> None:
+    scope = choose_insights_scope()
+    print("\nPSX Insights — live PSX data")
+
+    if scope == "sectors":
+        print("Fetching sector screener and breadth...\n")
+        stock_stats, breadth = _sector_performance_insights()
+        _print_sector_insights(stock_stats, breadth)
+        return
+
+    if scope in ("indices", "etfs", "mix"):
+        index_names: list[str] = []
+        etf_picks: list[tuple[str, str]] = []
+        if scope in ("indices", "mix"):
+            index_names = choose_indices_multi(
+                allow_empty=(scope == "mix"),
+            )
+        if scope in ("etfs", "mix"):
+            etf_picks = choose_etfs_multi(
+                allow_empty=(scope == "mix"),
+            )
+        if scope == "mix" and not index_names and not etf_picks:
+            print("  No indices or ETFs selected.")
+            return
+
+        print("\nFetching levels and period highs for your selection...\n")
+        snap_by_symbol = _snapshot_by_symbol() if index_names else {}
+
+        index_rows = [
+            _insights_for_index(name, snap_by_symbol) for name in index_names
+        ]
+        etf_rows = [
+            _insights_for_etf(sym, label) for sym, label in etf_picks
+        ]
+
+        if index_rows:
+            title = "PSX indices — selected (levels and period highs)"
+            if len(index_rows) == 1:
+                title = f"PSX index — {index_rows[0]['symbol']} (levels and period highs)"
+            _print_insights_market_table(title, index_rows)
+        if etf_rows:
+            title = "PSX ETFs — selected (levels and period highs)"
+            if len(etf_rows) == 1:
+                title = f"PSX ETF — {etf_rows[0]['symbol']} (levels and period highs)"
+            _print_insights_market_table(title, etf_rows)
+        return
+
+    print("Fetching market snapshot and historical highs (this may take a minute)...\n")
+    snap_by_symbol = _snapshot_by_symbol()
 
     index_rows: list[dict] = []
     for name in INDEX_NAMES:
-        print(f"  Index history: {name}...")
-        periods = _period_highs_from_ohlc(_historical_ohlc(name))
-        snap = snap_by_symbol.get(name, {})
-        index_rows.append(_insights_row(name, name, snap, periods))
+        index_rows.append(_insights_for_index(name, snap_by_symbol))
 
     etf_rows: list[dict] = []
     for _, etf in list_etf_symbols().iterrows():
         sym = str(etf["symbol"]).upper()
-        print(f"  ETF history: {sym}...")
-        periods = _period_highs_from_ohlc(_historical_ohlc(sym))
-        etf_rows.append(
-            _insights_row(sym, str(etf["name"]), {}, periods)
-        )
+        etf_rows.append(_insights_for_etf(sym, str(etf["name"])))
 
     stock_stats, breadth = _sector_performance_insights()
 
@@ -692,6 +771,11 @@ def choose_product_type() -> str:
         if choice in ("3", "insights", "insight"):
             return "insights"
         print("  Enter 1, 2, or 3.")
+
+
+def prompt_return_to_menu() -> bool:
+    raw = prompt("\nReturn to main menu? [Y/n]: ").lower()
+    return raw not in ("n", "no")
 
 
 def choose_etf() -> str:
@@ -962,6 +1046,112 @@ def prompt_non_negative_float(label: str, default: float) -> float:
     return value
 
 
+_INDEX_ALIASES = {
+    "KSE100": "KSE100",
+    "KSE100PR": "KSE100PR",
+    "KSE30": "KSE30",
+    "KMI30": "KMI30",
+}
+
+
+def _resolve_index_token(token: str) -> str | None:
+    key = token.upper().replace("-", "").replace(" ", "")
+    candidate = _INDEX_ALIASES.get(key, key)
+    if candidate in INDEX_NAMES:
+        return candidate
+    return None
+
+
+def _parse_index_selection(raw: str) -> list[str]:
+    selected: list[str] = []
+    seen: set[str] = set()
+    parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+    for part in parts:
+        if part.isdigit():
+            idx = int(part)
+            if 1 <= idx <= len(INDEX_NAMES):
+                name = INDEX_NAMES[idx - 1]
+            else:
+                print(f"  Skipping invalid index number: {idx}")
+                continue
+        else:
+            name = _resolve_index_token(part)
+            if not name:
+                print(f"  Unknown index: {part}")
+                continue
+        if name not in seen:
+            selected.append(name)
+            seen.add(name)
+    return selected
+
+
+def choose_indices_multi(*, allow_empty: bool = False) -> list[str]:
+    print("\nAvailable PSX indices:\n")
+    for i, name in enumerate(INDEX_NAMES, start=1):
+        print(f"  {i:2}. {name}")
+    print(
+        "\n  Tip: comma-separate for several (e.g. 1,3,6 or KSE100,KMI30)."
+    )
+    while True:
+        raw = prompt("Select indices (numbers or names): ")
+        picked = _parse_index_selection(raw)
+        if picked:
+            print(f"  Selected {len(picked)} index(es): {', '.join(picked)}")
+            return picked
+        if allow_empty and not raw.strip():
+            return []
+        print("  Pick at least one index (or leave blank only in a custom mix).")
+
+
+def choose_etfs_multi(*, allow_empty: bool = False) -> list[tuple[str, str]]:
+    etfs = list_etf_symbols()
+    if etfs.empty:
+        print("No ETFs found in PSX symbol list.")
+        return []
+
+    print("\nAvailable PSX ETFs:\n")
+    symbols: list[str] = []
+    names_by_symbol: dict[str, str] = {}
+    for i, row in etfs.iterrows():
+        sym = str(row["symbol"]).upper()
+        symbols.append(sym)
+        names_by_symbol[sym] = str(row["name"])
+        print(f"  {len(symbols):2}. {sym} — {row['name']}")
+    valid = set(symbols)
+    print(
+        "\n  Tip: comma-separate for several (e.g. 1,2 or MZNPETF,UBLPETF)."
+    )
+    while True:
+        raw = prompt("Select ETFs (numbers or symbols): ")
+        if allow_empty and not raw.strip():
+            return []
+
+        picked_syms: list[str] = []
+        seen: set[str] = set()
+        parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+        for part in parts:
+            if part.isdigit():
+                idx = int(part)
+                if 1 <= idx <= len(symbols):
+                    sym = symbols[idx - 1]
+                else:
+                    print(f"  Skipping invalid ETF number: {idx}")
+                    continue
+            else:
+                sym = part.upper()
+                if sym not in valid:
+                    print(f"  Unknown ETF: {part}")
+                    continue
+            if sym not in seen:
+                picked_syms.append(sym)
+                seen.add(sym)
+
+        if picked_syms:
+            print(f"  Selected {len(picked_syms)} ETF(s): {', '.join(picked_syms)}")
+            return [(s, names_by_symbol[s]) for s in picked_syms]
+        print("  Pick at least one ETF (or leave blank only in a custom mix).")
+
+
 def choose_index() -> str:
     print("\nAvailable PSX indices:\n")
     for i, name in enumerate(INDEX_NAMES, start=1):
@@ -975,16 +1165,9 @@ def choose_index() -> str:
                 return INDEX_NAMES[idx - 1]
             print("  Invalid selection.")
             continue
-        key = raw.upper().replace("-", "").replace(" ", "")
-        aliases = {
-            "KSE100": "KSE100",
-            "KSE100PR": "KSE100PR",
-            "KSE30": "KSE30",
-            "KMI30": "KMI30",
-        }
-        candidate = aliases.get(key, key)
-        if candidate in INDEX_NAMES:
-            return candidate
+        name = _resolve_index_token(raw)
+        if name:
+            return name
         print(f"  Unknown index. Pick 1–{len(INDEX_NAMES)} or a name from the list.")
 
 
@@ -1428,7 +1611,7 @@ def run_index_flow() -> None:
     filtered = apply_exclusions(df, exclude_sectors, exclude_symbols)
     if filtered.empty:
         print("All companies were excluded. Nothing to allocate.")
-        sys.exit(1)
+        return
     if len(filtered) < len(df):
         print(
             f"\nAfter exclusions: {len(filtered)} companies "
@@ -1452,7 +1635,7 @@ def run_etf_flow() -> None:
     filtered = apply_exclusions(df, exclude_sectors, exclude_symbols)
     if filtered.empty:
         print("All holdings were excluded. Nothing to allocate.")
-        sys.exit(1)
+        return
     if len(filtered) < len(df):
         print(
             f"\nAfter exclusions: {len(filtered)} holdings "
@@ -1471,13 +1654,18 @@ def main() -> None:
     print(f"Author: {__author__} · {__date__}")
     print("=" * 40)
 
-    product = choose_product_type()
-    if product == "etf":
-        run_etf_flow()
-    elif product == "insights":
-        run_insights_flow()
-    else:
-        run_index_flow()
+    while True:
+        product = choose_product_type()
+        if product == "etf":
+            run_etf_flow()
+        elif product == "insights":
+            run_insights_flow()
+        else:
+            run_index_flow()
+
+        if not prompt_return_to_menu():
+            print("\nDone.")
+            break
 
 
 if __name__ == "__main__":
