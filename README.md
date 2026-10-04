@@ -8,6 +8,8 @@ Interactive **Pakistan Stock Exchange (PSX)** tool:
 
 Data comes from [psxdata](https://pypi.org/project/psxdata/) (PSX Data Portal). Cache lives under `~/.psxdata/cache/` by default.
 
+**Author:** Salim Ali Khan · **Version:** 1.0.0 · **Date:** October 2026
+
 ## Requirements
 
 - Python **3.10+**

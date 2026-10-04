@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Interactive PSX index / ETF SIP planner and market insights using psxdata."""
+"""Interactive PSX index / ETF SIP planner and market insights using psxdata.
+
+Author: Salim Ali Khan · Version 1.0.0 · October 2026
+"""
+
+__version__ = "1.0.0"
+__author__ = "Salim Ali Khan"
+__date__ = "October 2026"
 
 from __future__ import annotations
 
@@ -1434,7 +1441,8 @@ def run_etf_flow() -> None:
 
 
 def main() -> None:
-    print("PSX Index / ETF SIP Planner (psxdata)")
+    print(f"PSX Index / ETF SIP Planner v{__version__} (psxdata)")
+    print(f"Author: {__author__} · {__date__}")
     print("=" * 40)
 
     product = choose_product_type()
