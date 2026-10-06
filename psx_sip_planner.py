@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.1.1"
+__version__ = "1.1.3"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -724,6 +724,10 @@ def choose_insights_scope() -> str:
     while True:
         choice = prompt("Select [1]: ") or "1"
         if choice in ("1", "full", "all", "a"):
+            print(
+                "\n  Note: full snapshot fetches every index and ETF "
+                "(slow). For a faster run use 2, 3, or 4 and pick only what you need."
+            )
             return "full"
         if choice in ("2", "index", "indices", "i"):
             return "indices"
@@ -915,16 +919,34 @@ def choose_etf() -> str:
         sys.exit(1)
 
     print_etf_basket_policy()
-    catalog = _load_etf_catalog()
+    if os.environ.get("PSX_SIP_PRELOAD_ETF_CATALOG", "").strip().lower() in (
+        "1",
+        "yes",
+        "true",
+    ):
+        catalog = _load_etf_catalog()
+    else:
+        catalog = {}
 
-    print("\nAvailable PSX ETFs (sector mix from latest PSX creation unit):\n")
+    print(
+        "\nAvailable PSX ETFs "
+        "(names only — full creation unit loads after you pick one):\n"
+    )
     symbols = etfs["symbol"].astype(str).tolist()
-    for i, row in etfs.iterrows():
+    scr, price_col = _market_price_index()
+    for pos, (_, row) in enumerate(etfs.iterrows(), start=1):
         sym = str(row["symbol"])
-        info = catalog.get(sym, {})
-        price_line = info.get("price_line", _format_etf_unit_price(None))
-        print(f"  {i + 1:2}. {sym} — {row['name']}  |  {price_line}")
-        print(f"      {info.get('line', '')}")
+        if sym in catalog:
+            info = catalog[sym]
+            price_line = info.get("price_line", _format_etf_unit_price(None))
+            print(f"  {pos:2}. {sym} — {row['name']}  |  {price_line}")
+            print(f"      {info.get('line', '')}")
+        else:
+            unit = _lookup_unit_price(sym, scr, price_col)
+            print(
+                f"  {pos:2}. {sym} — {row['name']}  |  "
+                f"{_format_etf_unit_price(unit)}"
+            )
     print()
     valid = set(symbols)
     while True:
@@ -1030,14 +1052,6 @@ def load_etf_frame(etf_symbol: str) -> tuple[pd.DataFrame, dict]:
     etf_symbol = etf_symbol.upper()
     if etf_symbol in _etf_frame_cache:
         return _etf_frame_cache[etf_symbol]
-
-    catalog = _etf_catalog or {}
-    entry = catalog.get(etf_symbol)
-    if entry and entry.get("kind") == "treasury":
-        _print_treasury_etf_basket(
-            etf_symbol,
-            {**entry["parsed"], "page_html": entry["html"]},
-        )
 
     print(f"\nFetching {etf_symbol} creation unit from PSX...")
     parsed, html = _fetch_etf_parsed(etf_symbol)
@@ -2397,7 +2411,7 @@ def print_switch_considerations(
         f"  Your holdings cover {covered:.2f}% of current basket equity weight; "
         f"{missing_total:.2f}% is in names you do not hold."
     )
-    alerts: list[pd.Series] = []
+    alerts: list[dict] = []
     top_syms = set(
         live_df.sort_values("idx_weight", ascending=False)
         .head(MISSING_TOP_N_ALERT)["symbol"]
@@ -2412,7 +2426,9 @@ def print_switch_considerations(
         if sym in top_syms:
             reasons.append(f"in current top {MISSING_TOP_N_ALERT}")
         if reasons:
-            alerts.append(row.assign(alert="; ".join(reasons)))
+            entry = row.to_dict()
+            entry["alert"] = "; ".join(reasons)
+            alerts.append(entry)
     if missing_total >= MISSING_TOTAL_WEIGHT_ALERT_PCT:
         print(
             f"  Note: combined missing weight {missing_total:.2f}% ≥ "

@@ -119,6 +119,7 @@ Works with `curl … \| python3 -` as long as the CSV path is on your machine (n
 | `PSX_SIP_HOLDINGS` | Path to holdings snapshot or plan CSV for top-up mode |
 | `PSX_SIP_HOLDINGS_KIND` | `auto`, `snapshot`, or `plan` |
 | `PSX_SIP_NO_LOCAL_STATE` | Do not read/write `~/.psx-sip/user_state.json` |
+| `PSX_SIP_PRELOAD_ETF_CATALOG` | Before ETF pick, fetch every ETF basket (old slow menu) |
 | `PSX_SIP_SKIP_BOOTSTRAP` | Do not attempt `pip install` |
 | `PSX_SIP_NO_PIP` | Exit with instructions if deps are missing |
 | `PSX_SIP_VERBOSE` | Show psxdata library warnings (OHLC/date cleanup on index history) |
