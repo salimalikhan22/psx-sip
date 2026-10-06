@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Interactive PSX index / ETF SIP planner and market insights using psxdata.
 
-Author: Salim Ali Khan · Version 1.0.8 · October 2026
+Author: Salim Ali Khan · Version 1.1.0 · October 2026
 
 Privacy: this script does not upload your holdings or plans. It only reads/writes
 files you choose locally and fetches public PSX market data (see README).
@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.0.8"
+__version__ = "1.1.0"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -807,8 +807,9 @@ def print_usage_tips() -> None:
     print(
         """
 Quick reference (type h or ? at any menu):
-  • First SIP: ETF/Index → 1 New plan → save holdings snapshot when asked.
-  • Next SIP:  ETF/Index → 2 Top-up → 1 Enter CSV path (any name you saved).
+  • Index & ETF (menus 1 & 2): new plan, top-up, scope, exclusions, snapshots.
+  • Next SIP: pick 1 or 2 → SIP mode 2 Top-up → enter CSV path (any name).
+  • Match check (menu 4): Index or ETF → CSV or SYMBOL:qty → resemblance %.
   • Paths: relative (from cwd), absolute, or ~/file.csv — all work.
   • Env: PSX_SIP_HOLDINGS=/path/to.csv skips the load menu in top-up.
   • Lost file? Top-up menu 2 (plan CSV) or 3 (SYMBOL:qty, e.g. FFC:1500).
@@ -837,9 +838,17 @@ def _is_help_choice(choice: str) -> bool:
 
 def choose_product_type() -> str:
     print("\nWhat would you like to plan?\n")
-    print("  1. PSX Index (constituent stocks by index weight)")
-    print("  2. ETF (underlying basket from PSX creation unit)")
+    print(
+        "  1. PSX Index SIP (new / top-up / scope — same features as ETF)"
+    )
+    print(
+        "  2. ETF SIP (new / top-up / scope — creation-unit basket)"
+    )
     print("  3. Insights (indices, ETFs, sector leaders — no SIP plan)")
+    print(
+        "  4. Compare my holdings to an index/ETF "
+        "(CSV or shares — how close am I?)"
+    )
     print("  h. Help (shortcuts)")
     print()
     while True:
@@ -853,7 +862,9 @@ def choose_product_type() -> str:
             return "etf"
         if choice in ("3", "insights", "insight"):
             return "insights"
-        print("  Enter 1, 2, 3, or h.")
+        if choice in ("4", "compare", "match", "align", "holdings"):
+            return "align"
+        print("  Enter 1, 2, 3, 4, or h.")
 
 
 def prompt_return_to_menu() -> bool:
@@ -1265,31 +1276,73 @@ def parse_price(value) -> float:
     return float(value)
 
 
-def load_index_frame(index_name: str) -> pd.DataFrame:
+def load_index_frame(index_name: str) -> tuple[pd.DataFrame, dict]:
     print(f"\nFetching {index_name} constituents from PSX (cached when available)...")
-    df = psxdata.indices(index_name)
-    if df is None or df.empty:
+    raw = psxdata.indices(index_name)
+    if raw is None or raw.empty:
         print(f"No data returned for index {index_name}.")
         sys.exit(1)
 
     symbols_meta = psxdata.symbols()
     if "sector_name" in symbols_meta.columns:
-        df = df.merge(
+        raw = raw.merge(
             symbols_meta[["symbol", "sector_name"]],
             on="symbol",
             how="left",
         )
     else:
-        df["sector_name"] = ""
+        raw["sector_name"] = ""
 
-    df["price"] = df["current"].map(parse_price)
-    df["idx_weight"] = pd.to_numeric(df["idx_weight"], errors="coerce")
-    df = df.dropna(subset=["price", "idx_weight"])
+    parsed_holdings: list[dict] = []
+    missing_price_symbols: list[str] = []
+    priced_rows: list[dict] = []
+
+    for _, row in raw.iterrows():
+        sym = str(row["symbol"]).upper()
+        name = str(row.get("name", sym))
+        parsed_holdings.append(
+            {"symbol": sym, "name": name, "basket_shares": None}
+        )
+        weight = pd.to_numeric(row.get("idx_weight"), errors="coerce")
+        try:
+            price = parse_price(row["current"])
+        except ValueError:
+            missing_price_symbols.append(sym)
+            continue
+        if weight is None or (isinstance(weight, float) and math.isnan(weight)):
+            missing_price_symbols.append(sym)
+            continue
+        priced_rows.append(
+            {
+                "symbol": sym,
+                "name": name,
+                "sector_name": str(row.get("sector_name", "") or "UNKNOWN"),
+                "price": float(price),
+                "idx_weight": float(weight),
+            }
+        )
+
+    if missing_price_symbols:
+        print(
+            f"  Warning: no live price/weight for {len(missing_price_symbols)} "
+            f"constituent(s): {', '.join(missing_price_symbols[:12])}"
+            + (" …" if len(missing_price_symbols) > 12 else "")
+        )
+
+    if not priced_rows:
+        print(f"No priced constituents for index {index_name}.")
+        sys.exit(1)
+
+    df = pd.DataFrame(priced_rows).sort_values("idx_weight", ascending=False)
     df["sector_name"] = df["sector_name"].fillna("UNKNOWN").astype(str)
-    return (
-        df.sort_values("idx_weight", ascending=False)
-        .reset_index(drop=True)
-    )
+    meta = {
+        "index_name": index_name,
+        "as_of": "",
+        "title": f"{index_name} index constituents",
+        "parsed_holdings": parsed_holdings,
+        "missing_price_symbols": missing_price_symbols,
+    }
+    return df.reset_index(drop=True), meta
 
 
 def sector_weight_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -1383,7 +1436,11 @@ def pick_top_n(df: pd.DataFrame, n: int) -> pd.DataFrame:
     return df.head(min(n, len(df))).copy()
 
 
-def prompt_exclusions(df: pd.DataFrame) -> tuple[set[str], set[str]]:
+def prompt_exclusions(
+    df: pd.DataFrame,
+    *,
+    universe_label: str = "index",
+) -> tuple[set[str], set[str]]:
     valid_symbols = set(df["symbol"].astype(str))
     sector_map = {
         s.upper(): s for s in sorted(df["sector_name"].unique(), key=str.casefold)
@@ -1393,7 +1450,7 @@ def prompt_exclusions(df: pd.DataFrame) -> tuple[set[str], set[str]]:
     print("Leave blank to include everything.\n")
 
     sector_list = list(sector_map.values())
-    print("Sectors in this index:")
+    print(f"Sectors in this {universe_label}:")
     for i, sector in enumerate(sector_list, start=1):
         count = (df["sector_name"] == sector).sum()
         w = df.loc[df["sector_name"] == sector, "idx_weight"].sum()
@@ -1424,15 +1481,23 @@ def prompt_exclusions(df: pd.DataFrame) -> tuple[set[str], set[str]]:
     return exclude_sectors, exclude_symbols
 
 
-def prompt_portfolio_scope(df: pd.DataFrame, index_name: str) -> pd.DataFrame:
+def prompt_portfolio_scope(
+    df: pd.DataFrame,
+    benchmark_name: str,
+    *,
+    universe_label: str = "index",
+    weight_label: str = "index",
+) -> pd.DataFrame:
     hint = ""
-    if index_name == "KMI30":
+    if universe_label == "index" and benchmark_name == "KMI30":
         hint = " (common for KMI30 SIP: top 5 ≈ 49% index weight, top 10 ≈ 79%)"
+    if universe_label == "ETF basket":
+        hint = " (partial ETF replication: top names cover most basket weight)"
 
-    print(f"\n--- Portfolio scope ---{hint}\n")
-    print("  1. All stocks in the index")
-    print("  2. Top 5 by index weight")
-    print("  3. Top 10 by index weight")
+    print(f"\n--- Portfolio scope ({benchmark_name}) ---{hint}\n")
+    print(f"  1. All holdings in the {universe_label}")
+    print(f"  2. Top 5 by {weight_label} weight")
+    print(f"  3. Top 10 by {weight_label} weight")
     print("  4. Custom top N")
     print("  5. One stock per sector (highest weight in each sector)")
     print()
@@ -1486,7 +1551,7 @@ def prompt_portfolio_scope(df: pd.DataFrame, index_name: str) -> pd.DataFrame:
         raw_w = selected["idx_weight"].sum()
         print(
             f"\nSelected {label}: {len(selected)} stocks covering "
-            f"{raw_w:.2f}% of index weight (before re-normalizing for SIP)."
+            f"{raw_w:.2f}% of {weight_label} weight (before re-normalizing for SIP)."
         )
         show = selected[["symbol", "sector_name", "price", "idx_weight"]].copy()
         show["price"] = show["price"].map(lambda p: f"{p:,.2f}")
@@ -1937,6 +2002,222 @@ def maybe_save_holdings_snapshot(
         )
 
 
+def _benchmark_target_pct(live_df: pd.DataFrame) -> pd.Series:
+    live = live_df.copy()
+    live["symbol"] = live["symbol"].astype(str).str.upper()
+    total = float(live["idx_weight"].sum())
+    if total <= 0:
+        return pd.Series(dtype=float)
+    s = live.set_index("symbol")["idx_weight"] / total
+    return s
+
+
+def report_holdings_alignment(
+    prior_shares: dict[str, int],
+    live_df: pd.DataFrame,
+    source_type: str,
+    source_id: str,
+) -> None:
+    """Compare user share counts to live index/ETF weights (no trades)."""
+    target = _benchmark_target_pct(live_df)
+    if target.empty:
+        print("  No benchmark weights available.")
+        return
+
+    live = live_df.copy()
+    live["symbol"] = live["symbol"].astype(str).str.upper()
+    by_sym = live.set_index("symbol")
+
+    held_rows: list[dict] = []
+    orphan_rows: list[dict] = []
+    total_value = 0.0
+
+    for sym, sh in prior_shares.items():
+        if sh <= 0:
+            continue
+        sym = sym.upper()
+        if sym not in by_sym.index:
+            orphan_rows.append({"symbol": sym, "shares": sh})
+            continue
+        price = float(by_sym.loc[sym, "price"])
+        value = sh * price
+        total_value += value
+        held_rows.append(
+            {
+                "symbol": sym,
+                "name": str(by_sym.loc[sym].get("name", "")),
+                "shares": sh,
+                "price": price,
+                "value_pkr": value,
+            }
+        )
+
+    if total_value <= 0:
+        print("  Could not value any in-basket holdings (check symbols/shares).")
+        if orphan_rows:
+            print(
+                "  Symbols not in basket: "
+                + ", ".join(r["symbol"] for r in orphan_rows)
+            )
+        return
+
+    user_vec = pd.Series(0.0, index=target.index)
+    for r in held_rows:
+        user_vec[r["symbol"]] = r["value_pkr"] / total_value
+
+    l1 = float((user_vec - target).abs().sum())
+    resemblance_pct = max(0.0, (1.0 - l1 / 2.0) * 100.0)
+    held_symbols = {r["symbol"] for r in held_rows}
+    coverage_weight = float(target.loc[list(held_symbols & set(target.index))].sum()) * 100.0
+    overlap_weight = float(pd.concat([user_vec, target], axis=1).min(axis=1).sum()) * 100.0
+
+    print(f"\n{'=' * 72}")
+    print(f"  Holdings vs {source_type.upper()} {source_id}")
+    print(f"{'=' * 72}")
+    print(
+        f"\n  Resemblance score: {resemblance_pct:.1f}% "
+        f"(100% = same names & weights as benchmark; "
+        f"0% = no overlap)"
+    )
+    print(
+        f"  Benchmark weight covered by your names: {coverage_weight:.1f}% "
+        f"({len(held_symbols)} of {len(target)} constituents)"
+    )
+    print(f"  Weight overlap (sum of min weights): {overlap_weight:.1f}%")
+    print(f"  Portfolio value marked (held, in basket): PKR {total_value:,.2f}")
+
+    detail = []
+    target_pct = target * 100.0
+    for r in held_rows:
+        sym = r["symbol"]
+        your_pct = r["value_pkr"] / total_value * 100.0
+        tgt = float(target_pct[sym])
+        held_only_total = float(target.loc[list(held_symbols)].sum()) * 100.0
+        tgt_on_held = tgt / held_only_total * 100.0 if held_only_total > 0 else 0.0
+        detail.append(
+            {
+                **r,
+                "your_pct": your_pct,
+                "benchmark_pct": tgt,
+                "benchmark_pct_on_held_subset": tgt_on_held,
+                "within_holdings_gap": your_pct - tgt_on_held,
+            }
+        )
+
+    print("\n  Your holdings vs benchmark (in-basket only):\n")
+    show = pd.DataFrame(detail)
+    disp = show[
+        [
+            "symbol",
+            "shares",
+            "value_pkr",
+            "your_pct",
+            "benchmark_pct",
+            "within_holdings_gap",
+        ]
+    ].copy()
+    disp["value_pkr"] = disp["value_pkr"].map(lambda v: f"{v:,.0f}")
+    disp["your_pct"] = disp["your_pct"].map(lambda v: f"{v:.2f}%")
+    disp["benchmark_pct"] = disp["benchmark_pct"].map(lambda v: f"{v:.2f}%")
+    disp["within_holdings_gap"] = disp["within_holdings_gap"].map(
+        lambda v: f"{v:+.2f} pp"
+    )
+    disp = disp.rename(
+        columns={
+            "benchmark_pct": "bench_%",
+            "your_pct": "your_%",
+            "within_holdings_gap": "vs_renorm_bench",
+        }
+    )
+    print(disp.sort_values("symbol").to_string(index=False))
+    print(
+        "\n  vs_renorm_bench: your weight minus benchmark weight re-normalized "
+        "to names you hold (+ = overweight within your portfolio)."
+    )
+
+    if orphan_rows:
+        print("\n  Not in current benchmark (still in your file):")
+        for r in orphan_rows:
+            print(f"    {r['symbol']}: {r['shares']} shares")
+
+    print_switch_considerations(held_symbols, live_df)
+    print(
+        "\n  (Review only — the planner does not ask you to confirm each add/sell; "
+        "use menu 1 or 2 when you want a SIP plan.)"
+    )
+
+
+def choose_align_benchmark_kind() -> str:
+    print("\nCompare your holdings to:\n")
+    print("  1. PSX Index")
+    print("  2. ETF (creation-unit basket)")
+    print()
+    while True:
+        choice = prompt("Select [1]: ") or "1"
+        if choice in ("1", "index", "i"):
+            return "index"
+        if choice in ("2", "etf", "e"):
+            return "etf"
+        print("  Enter 1 or 2.")
+
+
+def _scoped_frame_for_topup(
+    prior_shares: dict[str, int],
+    live_df: pd.DataFrame,
+) -> pd.DataFrame:
+    held = {s.upper() for s, q in prior_shares.items() if q > 0}
+    live = live_df.copy()
+    live["symbol"] = live["symbol"].astype(str).str.upper()
+    return live[live["symbol"].isin(held)].reset_index(drop=True)
+
+
+def run_holdings_align_flow() -> None:
+    kind = choose_align_benchmark_kind()
+    meta: dict | None = None
+    if kind == "index":
+        source_id = choose_index()
+        live_df, meta = load_index_frame(source_id)
+        print_overview_tables(live_df, source_id)
+        source_type = "index"
+    else:
+        source_id = choose_etf()
+        live_df, meta = load_etf_frame(source_id)
+        print_etf_overview(live_df, source_id, meta)
+        source_type = "etf"
+
+    print(
+        "\nLoad holdings to compare (holdings snapshot CSV, plan CSV, or manual)."
+    )
+    prior = choose_topup_holdings_source(
+        f"psx_sip_holdings_{source_id.lower()}.csv",
+        source_type,
+        source_id,
+    )
+    report_holdings_alignment(prior, live_df, source_type, source_id)
+
+    ans = prompt("\nPlan a top-up SIP from these same holdings? [y/N]: ").lower()
+    if ans not in ("y", "yes"):
+        return
+
+    scoped = _scoped_frame_for_topup(prior, live_df)
+    if scoped.empty:
+        print("  No held symbols in live basket; cannot top-up.")
+        return
+    investment_pkr = prompt_positive_float(
+        "\nMonthly SIP investment amount (PKR)"
+    )
+    _finalize_sip_plan(
+        scoped,
+        investment_pkr,
+        default_csv=f"psx_sip_plan_{source_id.lower()}.csv",
+        source_type=source_type,
+        source_id=source_id,
+        live_df=live_df,
+        meta=meta,
+        prior_shares=prior,
+    )
+
+
 def print_switch_considerations(
     held_symbols: set[str],
     live_df: pd.DataFrame,
@@ -2367,31 +2648,45 @@ def _finalize_sip_plan(
     )
 
 
-def run_index_flow() -> None:
-    index_name = choose_index()
-    df = load_index_frame(index_name)
-    print_overview_tables(df, index_name)
-
-    mode = choose_sip_mode(index_name)
+def _run_benchmark_sip_flow(
+    df: pd.DataFrame,
+    meta: dict,
+    *,
+    source_type: str,
+    source_id: str,
+    universe_label: str,
+    weight_label: str,
+    empty_exclusion_msg: str,
+    exclusion_unit: str,
+) -> None:
+    """Shared Index / ETF SIP path (new plan, top-up, scope, snapshot)."""
+    mode = choose_sip_mode(source_id)
     prior_shares: dict[str, int] | None = None
     scoped: pd.DataFrame
     if mode == "topup":
-        default_path = f"psx_sip_holdings_{index_name.lower()}.csv"
+        default_path = f"psx_sip_holdings_{source_id.lower()}.csv"
         scoped, prior_shares = run_topup_flow(
-            df, "index", index_name, default_path
+            df, source_type, source_id, default_path
         )
     else:
-        exclude_sectors, exclude_symbols = prompt_exclusions(df)
+        exclude_sectors, exclude_symbols = prompt_exclusions(
+            df, universe_label=universe_label
+        )
         filtered = apply_exclusions(df, exclude_sectors, exclude_symbols)
         if filtered.empty:
-            print("All companies were excluded. Nothing to allocate.")
+            print(empty_exclusion_msg)
             return
         if len(filtered) < len(df):
             print(
-                f"\nAfter exclusions: {len(filtered)} companies "
+                f"\nAfter exclusions: {len(filtered)} {exclusion_unit} "
                 f"(removed {len(df) - len(filtered)})."
             )
-        scoped = prompt_portfolio_scope(filtered, index_name)
+        scoped = prompt_portfolio_scope(
+            filtered,
+            source_id,
+            universe_label=universe_label,
+            weight_label=weight_label,
+        )
 
     investment_pkr = prompt_positive_float(
         "\nMonthly SIP investment amount (PKR)"
@@ -2400,11 +2695,28 @@ def run_index_flow() -> None:
     _finalize_sip_plan(
         scoped,
         investment_pkr,
-        default_csv=f"psx_sip_plan_{index_name.lower()}.csv",
+        default_csv=f"psx_sip_plan_{source_id.lower()}.csv",
+        source_type=source_type,
+        source_id=source_id,
+        live_df=df,
+        meta=meta,
+        prior_shares=prior_shares,
+    )
+
+
+def run_index_flow() -> None:
+    index_name = choose_index()
+    df, meta = load_index_frame(index_name)
+    print_overview_tables(df, index_name)
+    _run_benchmark_sip_flow(
+        df,
+        meta,
         source_type="index",
         source_id=index_name,
-        live_df=df,
-        prior_shares=prior_shares,
+        universe_label="index",
+        weight_label="index",
+        empty_exclusion_msg="All companies were excluded. Nothing to allocate.",
+        exclusion_unit="companies",
     )
 
 
@@ -2412,41 +2724,15 @@ def run_etf_flow() -> None:
     etf_symbol = choose_etf()
     df, meta = load_etf_frame(etf_symbol)
     print_etf_overview(df, etf_symbol, meta)
-
-    mode = choose_sip_mode(etf_symbol)
-    prior_shares: dict[str, int] | None = None
-    scoped: pd.DataFrame
-    if mode == "topup":
-        default_path = f"psx_sip_holdings_{etf_symbol.lower()}.csv"
-        scoped, prior_shares = run_topup_flow(
-            df, "etf", etf_symbol, default_path
-        )
-    else:
-        exclude_sectors, exclude_symbols = prompt_exclusions(df)
-        filtered = apply_exclusions(df, exclude_sectors, exclude_symbols)
-        if filtered.empty:
-            print("All holdings were excluded. Nothing to allocate.")
-            return
-        if len(filtered) < len(df):
-            print(
-                f"\nAfter exclusions: {len(filtered)} holdings "
-                f"(removed {len(df) - len(filtered)})."
-            )
-        scoped = filtered
-
-    investment_pkr = prompt_positive_float(
-        "\nMonthly SIP investment amount (PKR)"
-    )
-
-    _finalize_sip_plan(
-        scoped,
-        investment_pkr,
-        default_csv=f"psx_sip_plan_{etf_symbol.lower()}.csv",
+    _run_benchmark_sip_flow(
+        df,
+        meta,
         source_type="etf",
         source_id=etf_symbol,
-        live_df=df,
-        meta=meta,
-        prior_shares=prior_shares,
+        universe_label="ETF basket",
+        weight_label="basket",
+        empty_exclusion_msg="All holdings were excluded. Nothing to allocate.",
+        exclusion_unit="holdings",
     )
 
 
@@ -2462,6 +2748,8 @@ def main() -> None:
             run_etf_flow()
         elif product == "insights":
             run_insights_flow()
+        elif product == "align":
+            run_holdings_align_flow()
         else:
             run_index_flow()
 
