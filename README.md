@@ -83,7 +83,7 @@ Then update the curl URL in this README to match your repo.
 - The **GitHub script** is only source code — it does **not** contain your portfolio.
 - **No telemetry**: nothing is sent to the author; network use is **public PSX data** via `psxdata` (`dps.psx.com.pk`).
 - **Your CSVs stay on your machine** — plan/holdings files are written only when you confirm save, to a path you choose.
-- **`psxdata` cache** (`~/.psxdata/cache/` by default) stores **market** responses, not your holdings.
+- **psx-sip defaults to no cache** (live PSX). Optional `PSX_SIP_USE_CACHE=1` enables psxdata’s `~/.psxdata/cache/` (~15 min) and in-session ETF reuse.
 - **Optional local reminder** `~/.psx-sip/user_state.json` stores only the **path** to your last holdings file (not share counts). Set `PSX_SIP_NO_LOCAL_STATE=1` to disable.
 - **Do not commit** personal CSVs; this repo’s `.gitignore` excludes `*.csv`.
 
@@ -119,6 +119,8 @@ Works with `curl … \| python3 -` as long as the CSV path is on your machine (n
 | `PSX_SIP_HOLDINGS` | Path to holdings snapshot or plan CSV for top-up mode |
 | `PSX_SIP_HOLDINGS_KIND` | `auto`, `snapshot`, or `plan` |
 | `PSX_SIP_NO_LOCAL_STATE` | Do not read/write `~/.psx-sip/user_state.json` |
+| `PSX_SIP_USE_CACHE` | Enable psxdata disk cache (~15 min) and in-session ETF basket reuse |
+| `PSX_SIP_NO_CACHE` | Force live PSX (same as default; use if `USE_CACHE` is set in your shell) |
 | `PSX_SIP_PRELOAD_ETF_CATALOG` | Before ETF pick, fetch every ETF basket (old slow menu) |
 | `PSX_SIP_SKIP_BOOTSTRAP` | Do not attempt `pip install` |
 | `PSX_SIP_NO_PIP` | Exit with instructions if deps are missing |

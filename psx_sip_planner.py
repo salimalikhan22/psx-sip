@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.1.3"
+__version__ = "1.1.4"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -97,6 +97,53 @@ def _configure_psxdata() -> None:
 
 _configure_psxdata()
 
+
+def _use_data_cache() -> bool:
+    """psx-sip defaults to live PSX (no psxdata disk cache, no in-session ETF reuse)."""
+    if os.environ.get("PSX_SIP_NO_CACHE", "").strip().lower() in (
+        "1",
+        "yes",
+        "true",
+    ):
+        return False
+    return os.environ.get("PSX_SIP_USE_CACHE", "").strip().lower() in (
+        "1",
+        "yes",
+        "true",
+    )
+
+
+def fetch_symbols() -> pd.DataFrame:
+    return psxdata.symbols(cache=_use_data_cache())
+
+
+def fetch_screener() -> pd.DataFrame:
+    return psxdata.screener(cache=_use_data_cache())
+
+
+def fetch_indices(name: str) -> pd.DataFrame:
+    return psxdata.indices(name, cache=_use_data_cache())
+
+
+def fetch_sectors() -> pd.DataFrame:
+    return psxdata.sectors(cache=_use_data_cache())
+
+
+def fetch_stocks(
+    symbol: str,
+    start: str | None = None,
+    end: str | None = None,
+) -> pd.DataFrame:
+    if start is not None or end is not None:
+        return psxdata.stocks(
+            symbol,
+            start=start,
+            end=end,
+            cache=_use_data_cache(),
+        )
+    return psxdata.stocks(symbol, cache=_use_data_cache())
+
+
 BOARD_LOT = 500
 DEFAULT_COST_BUFFER_PCT = 0.5
 HOLDINGS_SNAPSHOT_VERSION = "2"
@@ -138,7 +185,7 @@ def _parse_num(raw: str) -> float:
 
 
 def list_etf_symbols() -> pd.DataFrame:
-    syms = psxdata.symbols()
+    syms = fetch_symbols()
     if "is_etf" not in syms.columns:
         return pd.DataFrame(columns=["symbol", "name"])
     etfs = syms[syms["is_etf"] == True].copy()  # noqa: E712
@@ -165,7 +212,7 @@ def print_etf_basket_policy() -> None:
 
 
 def _sector_by_symbol_map() -> dict[str, str]:
-    symbols_meta = psxdata.symbols()
+    symbols_meta = fetch_symbols()
     if "sector_name" not in symbols_meta.columns:
         return {}
     return (
@@ -174,7 +221,7 @@ def _sector_by_symbol_map() -> dict[str, str]:
 
 
 def _market_price_index() -> tuple[pd.DataFrame, str]:
-    screener = psxdata.screener()
+    screener = fetch_screener()
     if screener.empty or "symbol" not in screener.columns:
         print("Could not load market prices (screener empty).")
         sys.exit(1)
@@ -200,7 +247,7 @@ def _fallback_price_from_history(symbol: str, lookback_days: int = 21) -> float 
     end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=lookback_days)
     try:
-        hist = psxdata.stocks(sym, start=start.isoformat(), end=end.isoformat())
+        hist = fetch_stocks(sym, start=start.isoformat(), end=end.isoformat())
     except Exception:
         return None
     if hist is None or hist.empty or "close" not in hist.columns:
@@ -355,7 +402,7 @@ def _build_etf_frame_from_parsed(
 
 def _load_etf_catalog() -> dict[str, dict]:
     global _etf_catalog
-    if _etf_catalog is not None:
+    if _use_data_cache() and _etf_catalog is not None:
         return _etf_catalog
 
     etfs = list_etf_symbols()
@@ -405,7 +452,8 @@ def _load_etf_catalog() -> dict[str, dict]:
             }
             continue
         meta["etf_unit_price"] = etf_price
-        _etf_frame_cache[sym] = (df, meta)
+        if _use_data_cache():
+            _etf_frame_cache[sym] = (df, meta)
         catalog[sym] = {
             "kind": "equity",
             "line": _composition_summary_line(df, meta),
@@ -415,7 +463,8 @@ def _load_etf_catalog() -> dict[str, dict]:
             "html": html,
         }
 
-    _etf_catalog = catalog
+    if _use_data_cache():
+        _etf_catalog = catalog
     return catalog
 
 
@@ -462,7 +511,7 @@ def _fetch_indices_market_snapshot() -> pd.DataFrame:
 
 def _historical_ohlc(symbol: str) -> pd.DataFrame:
     try:
-        df = psxdata.stocks(symbol.upper())
+        df = fetch_stocks(symbol.upper())
     except Exception:
         return pd.DataFrame()
     if df.empty or "date" not in df.columns:
@@ -591,8 +640,8 @@ def _print_insights_market_table(title: str, rows: list[dict]) -> None:
 
 
 def _sector_performance_insights() -> tuple[pd.DataFrame, pd.DataFrame]:
-    scr = psxdata.screener()
-    sym_meta = psxdata.symbols()
+    scr = fetch_screener()
+    sym_meta = fetch_symbols()
     if scr.empty or sym_meta.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -617,7 +666,7 @@ def _sector_performance_insights() -> tuple[pd.DataFrame, pd.DataFrame]:
     )
     stock_stats = stock_stats[stock_stats["stocks"] >= 3].reset_index(drop=True)
 
-    psx_sectors = psxdata.sectors()
+    psx_sectors = fetch_sectors()
     breadth = pd.DataFrame()
     if not psx_sectors.empty and "sector_name" in psx_sectors.columns:
         breadth = psx_sectors.copy()
@@ -861,6 +910,15 @@ Quick reference (type h or ? at any menu):
 
 def print_startup_reminders() -> None:
     print("  Menus: type h or ? for shortcuts.")
+    if _use_data_cache():
+        print(
+            "  Data cache: ON (psxdata disk ~15 min + in-session ETF). "
+            "Unset PSX_SIP_USE_CACHE for live-only."
+        )
+    else:
+        print(
+            "  Data cache: OFF — live PSX each fetch (set PSX_SIP_USE_CACHE=1 to cache)."
+        )
     if not _local_state_enabled():
         return
     state = load_user_state()
@@ -1050,7 +1108,7 @@ def _print_treasury_etf_basket(etf_symbol: str, basket: dict) -> None:
 
 def load_etf_frame(etf_symbol: str) -> tuple[pd.DataFrame, dict]:
     etf_symbol = etf_symbol.upper()
-    if etf_symbol in _etf_frame_cache:
+    if _use_data_cache() and etf_symbol in _etf_frame_cache:
         return _etf_frame_cache[etf_symbol]
 
     print(f"\nFetching {etf_symbol} creation unit from PSX...")
@@ -1082,7 +1140,8 @@ def load_etf_frame(etf_symbol: str) -> tuple[pd.DataFrame, dict]:
                 etf_symbol, html, scr, price_col
             ),
         }
-    _etf_frame_cache[etf_symbol] = (df, meta)
+    if _use_data_cache():
+        _etf_frame_cache[etf_symbol] = (df, meta)
     return df, meta
 
 
@@ -1346,13 +1405,13 @@ def parse_price(value) -> float:
 
 
 def load_index_frame(index_name: str) -> tuple[pd.DataFrame, dict]:
-    print(f"\nFetching {index_name} constituents from PSX (cached when available)...")
-    raw = psxdata.indices(index_name)
+    print(f"\nFetching {index_name} constituents from PSX...")
+    raw = fetch_indices(index_name)
     if raw is None or raw.empty:
         print(f"No data returned for index {index_name}.")
         sys.exit(1)
 
-    symbols_meta = psxdata.symbols()
+    symbols_meta = fetch_symbols()
     if "sector_name" in symbols_meta.columns:
         raw = raw.merge(
             symbols_meta[["symbol", "sector_name"]],
