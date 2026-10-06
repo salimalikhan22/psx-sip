@@ -8,7 +8,7 @@ Interactive **Pakistan Stock Exchange (PSX)** tool:
 
 Data comes from [psxdata](https://pypi.org/project/psxdata/) (PSX Data Portal). Cache lives under `~/.psxdata/cache/` by default.
 
-**Author:** Salim Ali Khan · **Version:** 1.0.3 · **Date:** October 2026
+**Author:** Salim Ali Khan · **Version:** 1.0.8 · **Date:** October 2026
 
 ## Requirements
 
@@ -78,10 +78,47 @@ Then update the curl URL in this README to match your repo.
 | `psx_sip_planner.py` | Single entry point (SIP + insights) |
 | `requirements.txt` | Pinned minimum deps for venv installs |
 
+## Privacy (public script)
+
+- The **GitHub script** is only source code — it does **not** contain your portfolio.
+- **No telemetry**: nothing is sent to the author; network use is **public PSX data** via `psxdata` (`dps.psx.com.pk`).
+- **Your CSVs stay on your machine** — plan/holdings files are written only when you confirm save, to a path you choose.
+- **`psxdata` cache** (`~/.psxdata/cache/` by default) stores **market** responses, not your holdings.
+- **Optional local reminder** `~/.psx-sip/user_state.json` stores only the **path** to your last holdings file (not share counts). Set `PSX_SIP_NO_LOCAL_STATE=1` to disable.
+- **Do not commit** personal CSVs; this repo’s `.gitignore` excludes `*.csv`.
+
+At startup and after saving a snapshot, the planner prints what to do next. Type **`h`** at any menu for a short cheat sheet.
+
+## Pass an existing CSV (top-up)
+
+Interactive:
+
+1. Main menu → **2** (ETF or Index) → **2** Top-up existing holdings.
+2. Load menu **1** → type **any** CSV path (relative, absolute, or `~/…`). Snapshot and plan formats are auto-detected.
+
+Without retyping the path (env var):
+
+```bash
+PSX_SIP_HOLDINGS="$HOME/psx_sip_holdings_mznpetf.csv" python3 psx_sip_planner.py
+```
+
+Then choose ETF/Index → **2** Top-up. The planner loads that file and skips the holdings path prompt.
+
+| `PSX_SIP_HOLDINGS_KIND` | Effect |
+|-------------------------|--------|
+| `auto` (default) | Detect snapshot (`# psx-sip-holdings` header) vs plan CSV |
+| `snapshot` | Force holdings snapshot format (`shares_held` column) |
+| `plan` | Force SIP plan CSV (`symbol` + `shares` or `shares_held`) |
+
+Works with `curl … \| python3 -` as long as the CSV path is on your machine (not stdin).
+
 ## Environment variables
 
 | Variable | Effect |
 |----------|--------|
+| `PSX_SIP_HOLDINGS` | Path to holdings snapshot or plan CSV for top-up mode |
+| `PSX_SIP_HOLDINGS_KIND` | `auto`, `snapshot`, or `plan` |
+| `PSX_SIP_NO_LOCAL_STATE` | Do not read/write `~/.psx-sip/user_state.json` |
 | `PSX_SIP_SKIP_BOOTSTRAP` | Do not attempt `pip install` |
 | `PSX_SIP_NO_PIP` | Exit with instructions if deps are missing |
 | `PSX_SIP_VERBOSE` | Show psxdata library warnings (OHLC/date cleanup on index history) |

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Interactive PSX index / ETF SIP planner and market insights using psxdata.
 
-Author: Salim Ali Khan · Version 1.0.3 · October 2026
+Author: Salim Ali Khan · Version 1.0.8 · October 2026
+
+Privacy: this script does not upload your holdings or plans. It only reads/writes
+files you choose locally and fetches public PSX market data (see README).
 """
 
 from __future__ import annotations
 
-__version__ = "1.0.3"
+__version__ = "1.0.8"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -65,10 +68,11 @@ def _bootstrap_dependencies() -> None:
 
 _bootstrap_dependencies()
 
+import json
 import logging
 import math
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import psxdata
@@ -95,6 +99,10 @@ _configure_psxdata()
 
 BOARD_LOT = 500
 DEFAULT_COST_BUFFER_PCT = 0.5
+HOLDINGS_SNAPSHOT_VERSION = "1"
+MISSING_WEIGHT_ALERT_PCT = 3.0
+MISSING_TOP_N_ALERT = 10
+MISSING_TOTAL_WEIGHT_ALERT_PCT = 15.0
 _ETF_BASKET_UNIT_RE = re.compile(r"Per\s+([\d,]+)\s+ETF\s+Units", re.I)
 _ETF_CASH_RE = re.compile(r"Cash Component:\s*Rs\.?\s*([\d,]+(?:\.\d+)?)", re.I)
 _ETF_CASH_PCT_RE = re.compile(
@@ -300,6 +308,8 @@ def _build_etf_frame_from_parsed(
         else (cash_pkr / basket_total * 100.0),
         "as_of": parsed.get("as_of", ""),
         "title": parsed["title"],
+        "missing_price_symbols": list(missing_prices),
+        "parsed_holdings": list(parsed["holdings"]),
     }
     return (
         df.sort_values("idx_weight", ascending=False).reset_index(drop=True),
@@ -756,21 +766,94 @@ def run_insights_flow() -> None:
     _print_sector_insights(stock_stats, breadth)
 
 
+def _local_state_enabled() -> bool:
+    return os.environ.get("PSX_SIP_NO_LOCAL_STATE", "").strip().lower() not in (
+        "1",
+        "yes",
+        "true",
+    )
+
+
+def _user_state_file() -> str:
+    return os.path.join(os.path.expanduser("~"), ".psx-sip", "user_state.json")
+
+
+def load_user_state() -> dict:
+    if not _local_state_enabled():
+        return {}
+    path = _user_state_file()
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_user_state(**fields: str) -> None:
+    if not _local_state_enabled():
+        return
+    state = load_user_state()
+    state.update(fields)
+    state["updated_at"] = _utc_now_iso()
+    os.makedirs(os.path.dirname(_user_state_file()), exist_ok=True)
+    with open(_user_state_file(), "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2)
+
+
+def print_usage_tips() -> None:
+    print(
+        """
+Quick reference (type h or ? at any menu):
+  • First SIP: ETF/Index → 1 New plan → save holdings snapshot when asked.
+  • Next SIP:  ETF/Index → 2 Top-up → 1 Enter CSV path (any name you saved).
+  • Paths: relative (from cwd), absolute, or ~/file.csv — all work.
+  • Env: PSX_SIP_HOLDINGS=/path/to.csv skips the load menu in top-up.
+  • Lost file? Top-up menu 2 (plan CSV) or 3 (SYMBOL:qty, e.g. FFC:1500).
+  • Local reminder only: ~/.psx-sip/user_state.json (last file path). Set
+    PSX_SIP_NO_LOCAL_STATE=1 to disable. Nothing is sent to the internet.
+""".strip()
+    )
+
+
+def print_startup_reminders() -> None:
+    print("  Menus: type h or ? for shortcuts.")
+    if not _local_state_enabled():
+        return
+    state = load_user_state()
+    last = state.get("last_holdings_path", "")
+    if last and os.path.isfile(last):
+        sid = state.get("last_source_id", "")
+        tag = f" ({sid})" if sid else ""
+        print(f"  Last holdings file{tag}: {last}")
+        print(f"  Next top-up: menu 2, or PSX_SIP_HOLDINGS={last!r}")
+
+
+def _is_help_choice(choice: str) -> bool:
+    return choice.strip().lower() in ("h", "?", "help")
+
+
 def choose_product_type() -> str:
     print("\nWhat would you like to plan?\n")
     print("  1. PSX Index (constituent stocks by index weight)")
     print("  2. ETF (underlying basket from PSX creation unit)")
     print("  3. Insights (indices, ETFs, sector leaders — no SIP plan)")
+    print("  h. Help (shortcuts)")
     print()
     while True:
         choice = prompt("Select [1]: ") or "1"
+        if _is_help_choice(choice):
+            print_usage_tips()
+            continue
         if choice in ("1", "index", "i"):
             return "index"
         if choice in ("2", "etf", "e"):
             return "etf"
         if choice in ("3", "insights", "insight"):
             return "insights"
-        print("  Enter 1, 2, or 3.")
+        print("  Enter 1, 2, 3, or h.")
 
 
 def prompt_return_to_menu() -> bool:
@@ -1569,6 +1652,668 @@ def print_plan(
         )
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _parse_snapshot_header_line(line: str) -> tuple[str, str] | None:
+    line = line.strip()
+    if not line.startswith("#"):
+        return None
+    body = line.lstrip("#").strip()
+    if "=" not in body:
+        return None
+    key, _, val = body.partition("=")
+    return key.strip(), val.strip()
+
+
+def build_holdings_snapshot_rows(
+    plan: pd.DataFrame,
+    live_df: pd.DataFrame,
+    *,
+    source_type: str,
+    source_id: str,
+    parsed_holdings: list[dict] | None,
+    missing_price_symbols: list[str],
+    prior_shares: dict[str, int] | None,
+) -> pd.DataFrame:
+    """One row per basket line; includes names we could not price on PSX."""
+    missing_set = {s.upper() for s in missing_price_symbols}
+    live_by_sym = live_df.set_index("symbol") if not live_df.empty else pd.DataFrame()
+    plan_by_sym = plan.set_index("symbol") if not plan.empty else pd.DataFrame()
+    prior = prior_shares or {}
+
+    def _row(
+        symbol: str,
+        name: str,
+        sector_name: str,
+        basket_shares: float | None,
+        price: float | None,
+        idx_weight: float | None,
+        data_status: str,
+        notes: str,
+    ) -> dict:
+        sym = symbol.upper()
+        shares_this = int(plan_by_sym.loc[sym, "shares"]) if sym in plan_by_sym.index else 0
+        invested_this = (
+            float(plan_by_sym.loc[sym, "invested_pkr"]) if sym in plan_by_sym.index else 0.0
+        )
+        if sym in prior:
+            shares_held = int(prior[sym]) + shares_this
+        else:
+            shares_held = shares_this
+        return {
+            "symbol": sym,
+            "name": name,
+            "sector_name": sector_name or "",
+            "basket_shares": basket_shares,
+            "price": price,
+            "idx_weight_pct": idx_weight,
+            "shares_held": shares_held,
+            "shares_this_run": shares_this,
+            "invested_pkr_this_run": invested_this,
+            "data_status": data_status,
+            "notes": notes,
+        }
+
+    rows: list[dict] = []
+    if parsed_holdings:
+        for h in parsed_holdings:
+            sym = str(h["symbol"]).upper()
+            name = str(h.get("name", ""))
+            b_sh = float(h.get("basket_shares", 0))
+            if sym in missing_set:
+                sector = ""
+                rows.append(
+                    _row(
+                        sym,
+                        name,
+                        sector,
+                        b_sh,
+                        None,
+                        None,
+                        "no_live_price",
+                        "Could not fetch live price from PSX screener",
+                    )
+                )
+                continue
+            if sym not in live_by_sym.index:
+                rows.append(
+                    _row(
+                        sym,
+                        name,
+                        "",
+                        b_sh,
+                        None,
+                        None,
+                        "not_in_live_basket",
+                        "Listed in creation unit but missing from priced frame",
+                    )
+                )
+                continue
+            lr = live_by_sym.loc[sym]
+            rows.append(
+                _row(
+                    sym,
+                    str(lr.get("name", name)),
+                    str(lr.get("sector_name", "")),
+                    b_sh,
+                    float(lr["price"]),
+                    float(lr["idx_weight"]),
+                    "ok",
+                    "",
+                )
+            )
+        seen = {r["symbol"] for r in rows}
+        for sym, sh in prior.items():
+            if sh <= 0 or sym in seen:
+                continue
+            rows.append(
+                _row(
+                    sym,
+                    "",
+                    "",
+                    None,
+                    None,
+                    None,
+                    "held_not_in_basket",
+                    "Shares from your file; not in current published basket",
+                )
+            )
+        return pd.DataFrame(rows)
+
+    for _, lr in live_df.iterrows():
+        sym = str(lr["symbol"]).upper()
+        rows.append(
+            _row(
+                sym,
+                str(lr.get("name", "")),
+                str(lr.get("sector_name", "")),
+                None,
+                float(lr["price"]),
+                float(lr["idx_weight"]),
+                "ok",
+                "",
+            )
+        )
+    if prior:
+        seen = {r["symbol"] for r in rows}
+        for sym, sh in prior.items():
+            if sh <= 0 or sym in seen:
+                continue
+            rows.append(
+                _row(
+                    sym,
+                    "",
+                    "",
+                    None,
+                    None,
+                    None,
+                    "held_not_in_basket",
+                    "Shares from your file; not in current index/scope",
+                )
+            )
+    return pd.DataFrame(rows)
+
+
+def write_holdings_snapshot(
+    path: str,
+    table: pd.DataFrame,
+    header: dict[str, str],
+) -> None:
+    lines = [
+        f"# psx-sip-holdings snapshot_version={HOLDINGS_SNAPSHOT_VERSION}",
+    ]
+    for key in sorted(header.keys()):
+        val = str(header[key]).replace("\n", " ")
+        lines.append(f"# {key}={val}")
+    lines.append(
+        "# Edit shares_held between runs if you bought outside this planner."
+    )
+    lines.append(
+        "# Pass this file on the next SIP as your last holdings snapshot."
+    )
+    lines.append(
+        "# If you lose this file: top-up mode also accepts an old plan CSV or manual SYMBOL:qty."
+    )
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+        table.to_csv(fh, index=False)
+
+
+def load_holdings_snapshot(path: str) -> tuple[dict[str, str], pd.DataFrame]:
+    if not os.path.isfile(path):
+        print(f"  File not found: {path}")
+        sys.exit(1)
+    header: dict[str, str] = {}
+    data_lines: list[str] = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("#"):
+                parsed = _parse_snapshot_header_line(line)
+                if parsed:
+                    header[parsed[0]] = parsed[1]
+                continue
+            data_lines.append(line)
+    if header.get("snapshot_version") not in (None, HOLDINGS_SNAPSHOT_VERSION):
+        print(
+            f"  Warning: snapshot version {header.get('snapshot_version')} "
+            f"(planner expects {HOLDINGS_SNAPSHOT_VERSION})."
+        )
+    from io import StringIO
+
+    if not data_lines or not data_lines[0].strip():
+        print("  Holdings file has no data rows.")
+        sys.exit(1)
+    df = pd.read_csv(StringIO("".join(data_lines)))
+    required = {"symbol", "shares_held"}
+    if not required.issubset(df.columns):
+        print(f"  Holdings file must include columns: {', '.join(sorted(required))}")
+        sys.exit(1)
+    df["symbol"] = df["symbol"].astype(str).str.upper()
+    df["shares_held"] = pd.to_numeric(df["shares_held"], errors="coerce").fillna(0).astype(int)
+    return header, df
+
+
+def maybe_save_holdings_snapshot(
+    plan: pd.DataFrame,
+    live_df: pd.DataFrame,
+    *,
+    source_type: str,
+    source_id: str,
+    investment_pkr: float,
+    cost_buffer_pct: float,
+    use_board_lot: bool,
+    meta: dict | None,
+    prior_shares: dict[str, int] | None,
+    default_name: str,
+) -> None:
+    answer = prompt(
+        "\nSave holdings snapshot for your next top-up SIP? [Y/n]: "
+    ).lower()
+    if answer not in ("", "y", "yes"):
+        return
+    print("  Save as relative or absolute path (any filename you like).")
+    path_raw = prompt(f"Holdings file path [{default_name}]: ") or default_name
+    path = resolve_user_path(path_raw)
+    parsed_holdings = (meta or {}).get("parsed_holdings")
+    missing = (meta or {}).get("missing_price_symbols") or []
+    table = build_holdings_snapshot_rows(
+        plan,
+        live_df,
+        source_type=source_type,
+        source_id=source_id,
+        parsed_holdings=parsed_holdings,
+        missing_price_symbols=missing,
+        prior_shares=prior_shares,
+    )
+    snap_header = {
+        "planner_version": __version__,
+        "generated_at": _utc_now_iso(),
+        "source_type": source_type,
+        "source_id": source_id,
+        "investment_pkr_this_run": f"{investment_pkr:.2f}",
+        "cost_buffer_pct": f"{cost_buffer_pct:.2f}",
+        "board_lot": "yes" if use_board_lot else "no",
+        "basket_as_of": str((meta or {}).get("as_of", "")),
+    }
+    write_holdings_snapshot(path, table, snap_header)
+    abs_path = os.path.abspath(path)
+    print(f"Saved holdings snapshot: {abs_path}")
+    save_user_state(
+        last_holdings_path=abs_path,
+        last_source_type=source_type,
+        last_source_id=source_id,
+    )
+    print(
+        "  Next run: ETF/Index → 2 Top-up (this file is remembered locally), "
+        f"or PSX_SIP_HOLDINGS={abs_path!r}"
+    )
+    n_bad = (table["data_status"] != "ok").sum() if "data_status" in table.columns else 0
+    if n_bad:
+        print(
+            f"  {n_bad} row(s) have data_status other than ok "
+            f"(e.g. no_live_price) — fix or ignore when editing shares_held."
+        )
+
+
+def print_switch_considerations(
+    held_symbols: set[str],
+    live_df: pd.DataFrame,
+) -> None:
+    if live_df.empty:
+        return
+    missing = live_df[~live_df["symbol"].isin(held_symbols)].copy()
+    if missing.empty:
+        print("\nYou hold every priced line in the current basket.")
+        return
+    missing = missing.sort_values("idx_weight", ascending=False)
+    covered = live_df.loc[live_df["symbol"].isin(held_symbols), "idx_weight"].sum()
+    missing_total = float(missing["idx_weight"].sum())
+    print(f"\n--- Consider switching? (you do not hold these basket names) ---")
+    print(
+        f"  Your holdings cover {covered:.2f}% of current basket equity weight; "
+        f"{missing_total:.2f}% is in names you do not hold."
+    )
+    alerts: list[pd.Series] = []
+    top_syms = set(
+        live_df.sort_values("idx_weight", ascending=False)
+        .head(MISSING_TOP_N_ALERT)["symbol"]
+        .astype(str)
+    )
+    for _, row in missing.iterrows():
+        w = float(row["idx_weight"])
+        sym = str(row["symbol"])
+        reasons: list[str] = []
+        if w >= MISSING_WEIGHT_ALERT_PCT:
+            reasons.append(f"weight {w:.2f}% ≥ {MISSING_WEIGHT_ALERT_PCT:g}%")
+        if sym in top_syms:
+            reasons.append(f"in current top {MISSING_TOP_N_ALERT}")
+        if reasons:
+            alerts.append(row.assign(alert="; ".join(reasons)))
+    if missing_total >= MISSING_TOTAL_WEIGHT_ALERT_PCT:
+        print(
+            f"  Note: combined missing weight {missing_total:.2f}% ≥ "
+            f"{MISSING_TOTAL_WEIGHT_ALERT_PCT:g}% — portfolio may be far from full ETF."
+        )
+    if not alerts:
+        print("  No single name crossed the default alert thresholds (edit thresholds in code).")
+        show = missing.head(8)[["symbol", "name", "idx_weight"]].copy()
+        show["idx_weight"] = show["idx_weight"].map(lambda w: f"{w:.2f}%")
+        print("\n  Largest names you do not hold:")
+        print(show.to_string(index=False))
+        return
+    alert_df = pd.DataFrame(alerts)
+    show = alert_df[["symbol", "name", "idx_weight", "alert"]].copy()
+    show["idx_weight"] = show["idx_weight"].map(lambda w: f"{w:.2f}%")
+    print("\n  Flagged for review (not auto-added to this top-up):")
+    print(show.to_string(index=False))
+
+
+def choose_sip_mode(source_id: str = "") -> str:
+    print("\nHow should this SIP run?\n")
+    print("  1. New plan (pick scope / exclusions as usual)")
+    print(
+        "  2. Top-up existing holdings only "
+        "(snapshot CSV, old plan CSV, or manual entry)"
+    )
+    print("  h. Help (shortcuts)")
+    default_snap = (
+        f"psx_sip_holdings_{source_id.lower()}.csv" if source_id else ""
+    )
+    if default_snap and os.path.isfile(default_snap):
+        print(f"\n  → Found ./{default_snap} — option 2 will offer to use it.")
+    state = load_user_state()
+    last = state.get("last_holdings_path", "")
+    if last and os.path.isfile(last):
+        print(f"  → Last saved: {last}")
+    print()
+    while True:
+        choice = prompt("Select [1]: ") or "1"
+        if _is_help_choice(choice):
+            print_usage_tips()
+            continue
+        if choice in ("1", "new", "fresh", "n"):
+            return "fresh"
+        if choice in ("2", "topup", "top-up", "holdings", "continue", "c"):
+            return "topup"
+        print("  Enter 1, 2, or h.")
+
+
+def resolve_user_path(raw: str) -> str:
+    """Expand ~ and resolve relative paths against the current working directory."""
+    return os.path.abspath(os.path.expanduser(raw.strip()))
+
+
+def prompt_existing_csv_path() -> str:
+    print("\n  Path can be relative, absolute, or use ~")
+    print(f"  Current folder: {os.getcwd()}\n")
+    while True:
+        raw = prompt("CSV path: ").strip()
+        if not raw:
+            print("  Enter a path (required), or h for help.")
+            continue
+        if _is_help_choice(raw):
+            print_usage_tips()
+            continue
+        path = resolve_user_path(raw)
+        if os.path.isfile(path):
+            return path
+        print(f"  Not found: {path}")
+
+
+def _parse_manual_holdings(raw: str) -> dict[str, int]:
+    """SYMBOL:qty pairs, comma/space separated (e.g. FFC:1500, ENGRO:10)."""
+    out: dict[str, int] = {}
+    if not raw.strip():
+        return out
+    parts = re.split(r"[,;\s]+", raw.strip())
+    for part in parts:
+        if not part:
+            continue
+        if ":" in part:
+            sym, _, qty_s = part.partition(":")
+        elif "=" in part:
+            sym, _, qty_s = part.partition("=")
+        else:
+            print(f"  Skipping {part!r} — use SYMBOL:qty")
+            continue
+        sym = sym.strip().upper()
+        try:
+            qty = int(float(qty_s.strip().replace(",", "")))
+        except ValueError:
+            print(f"  Skipping {part!r} — invalid quantity")
+            continue
+        if qty <= 0:
+            continue
+        out[sym] = out.get(sym, 0) + qty
+    return out
+
+
+def prompt_manual_holdings() -> dict[str, int]:
+    print(
+        "\nEnter each position as SYMBOL:share_count "
+        "(comma-separated). Use broker statement totals.\n"
+    )
+    while True:
+        raw = prompt("Holdings (e.g. FFC:1500, MEBL:2, OGDC:6): ")
+        prior = _parse_manual_holdings(raw)
+        if prior:
+            return prior
+        print("  Enter at least one symbol with shares > 0.")
+
+
+def load_prior_shares_from_plan_csv(path: str) -> dict[str, int]:
+    df = pd.read_csv(path)
+    if "symbol" not in df.columns:
+        print("  Plan CSV must include a 'symbol' column.")
+        sys.exit(1)
+    df["symbol"] = df["symbol"].astype(str).str.upper()
+    if "shares_held" in df.columns:
+        qty_col = "shares_held"
+    elif "shares" in df.columns:
+        qty_col = "shares"
+        print(
+            "\n  Note: using the plan's 'shares' column as your position. "
+            "That is only one month's buys unless you edited the file — "
+            "adjust totals if needed before saving a new snapshot."
+        )
+    else:
+        print("  Plan CSV needs 'shares_held' or 'shares'.")
+        sys.exit(1)
+    df[qty_col] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0).astype(int)
+    df = df[df[qty_col] > 0]
+    if df.empty:
+        print("  No rows with share count > 0 in that plan CSV.")
+        sys.exit(1)
+    return df.groupby("symbol")[qty_col].sum().astype(int).to_dict()
+
+
+def _is_holdings_snapshot_file(path: str) -> bool:
+    with open(path, encoding="utf-8") as fh:
+        for _ in range(5):
+            line = fh.readline()
+            if not line:
+                break
+            if line.strip().startswith("# psx-sip-holdings"):
+                return True
+            if line.strip() and not line.startswith("#"):
+                break
+    return False
+
+
+def _load_prior_shares_from_any_csv(
+    path: str,
+    source_type: str,
+    source_id: str,
+) -> dict[str, int]:
+    kind = os.environ.get("PSX_SIP_HOLDINGS_KIND", "auto").strip().lower()
+    use_snapshot = kind in ("snapshot", "holdings", "h")
+    use_plan = kind in ("plan", "p")
+    if kind == "auto" or kind in ("", "a"):
+        use_snapshot = _is_holdings_snapshot_file(path)
+        use_plan = not use_snapshot
+    if use_snapshot:
+        header, snap = load_holdings_snapshot(path)
+        _warn_if_snapshot_mismatch(header, source_type, source_id)
+        held = snap[snap["shares_held"] > 0]
+        if held.empty:
+            print("  No shares_held > 0 in the holdings file.")
+            sys.exit(1)
+        return {
+            str(r["symbol"]).upper(): int(r["shares_held"])
+            for _, r in held.iterrows()
+        }
+    if use_plan:
+        return load_prior_shares_from_plan_csv(path)
+    print(f"  Unknown PSX_SIP_HOLDINGS_KIND={kind!r} (use auto, snapshot, or plan).")
+    sys.exit(1)
+
+
+def _env_holdings_csv_path() -> str | None:
+    raw = os.environ.get("PSX_SIP_HOLDINGS", "").strip()
+    if not raw:
+        return None
+    path = os.path.expanduser(raw)
+    if not os.path.isfile(path):
+        print(f"  PSX_SIP_HOLDINGS file not found: {path}")
+        sys.exit(1)
+    return path
+
+
+def _discover_holdings_file_options(default_snapshot: str) -> list[tuple[str, str]]:
+    seen: set[str] = set()
+    options: list[tuple[str, str]] = []
+
+    def add(label: str, path: str) -> None:
+        absp = os.path.abspath(os.path.expanduser(path))
+        if absp in seen or not os.path.isfile(absp):
+            return
+        seen.add(absp)
+        options.append((label, absp))
+
+    state = load_user_state()
+    last = state.get("last_holdings_path", "")
+    if last:
+        sid = state.get("last_source_id", "")
+        lbl = "Last saved holdings"
+        if sid:
+            lbl += f" ({sid})"
+        add(lbl, last)
+    if default_snapshot:
+        add(f"File in this folder ({default_snapshot})", default_snapshot)
+    return options
+
+
+def choose_topup_holdings_source(
+    default_snapshot: str,
+    source_type: str,
+    source_id: str,
+) -> dict[str, int]:
+    env_path = _env_holdings_csv_path()
+    if env_path:
+        print(f"\nUsing PSX_SIP_HOLDINGS: {env_path}")
+        return _load_prior_shares_from_any_csv(env_path, source_type, source_id)
+
+    discovered = _discover_holdings_file_options(default_snapshot)
+
+    while True:
+        print("\nLoad holdings for top-up:\n")
+        print(
+            "  1. Enter CSV path (any name — holdings snapshot or plan CSV)"
+        )
+        menu_paths: list[tuple[str, str]] = []
+        next_idx = 2
+        for label, path in discovered:
+            print(f"  {next_idx}. {label}")
+            print(f"     {path}")
+            menu_paths.append((label, path))
+            next_idx += 1
+        manual_idx = next_idx
+        print(f"  {manual_idx}. Type holdings manually (SYMBOL:qty)")
+        print("  h. Help (shortcuts)")
+        print()
+
+        raw = prompt("Select [1]: ") or "1"
+        if _is_help_choice(raw):
+            print_usage_tips()
+            continue
+        if not raw.isdigit():
+            print(f"  Enter 1–{manual_idx} or h.")
+            continue
+        pick = int(raw)
+
+        if pick == 1:
+            path = prompt_existing_csv_path()
+            print(f"\nUsing: {path}")
+            return _load_prior_shares_from_any_csv(path, source_type, source_id)
+
+        if 2 <= pick < manual_idx:
+            path = menu_paths[pick - 2][1]
+            print(f"\nUsing: {path}")
+            return _load_prior_shares_from_any_csv(path, source_type, source_id)
+
+        if pick == manual_idx:
+            return prompt_manual_holdings()
+
+        print(f"  Enter 1–{manual_idx} or h.")
+
+
+def _warn_if_snapshot_mismatch(
+    header: dict[str, str] | None,
+    source_type: str,
+    source_id: str,
+) -> None:
+    if not header:
+        return
+    file_type = header.get("source_type", "")
+    file_id = header.get("source_id", "")
+    if file_type and file_type != source_type:
+        print(
+            f"  Warning: prior file source_type={file_type!r} "
+            f"but you selected {source_type!r}."
+        )
+    if file_id and file_id.upper() != source_id.upper():
+        ans = prompt(
+            f"  Prior record is for {file_id!r}, you chose {source_id!r}. "
+            "Continue anyway? [y/N]: "
+        ).lower()
+        if ans not in ("y", "yes"):
+            sys.exit(0)
+
+
+def run_topup_from_prior_shares(
+    prior_shares: dict[str, int],
+    live_df: pd.DataFrame,
+    source_type: str,
+    source_id: str,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    held_symbols = {s for s, q in prior_shares.items() if q > 0}
+    if not held_symbols:
+        print("  No holdings with share count > 0.")
+        sys.exit(1)
+
+    subset = live_df[live_df["symbol"].isin(held_symbols)].copy()
+    missing_live = held_symbols - set(subset["symbol"].astype(str))
+    if missing_live:
+        print(
+            "  Warning: no current basket price/weight for: "
+            + ", ".join(sorted(missing_live))
+        )
+    if subset.empty:
+        print("  None of your held symbols appear in the live basket.")
+        sys.exit(1)
+
+    if len(subset) < len(held_symbols):
+        for sym in sorted(held_symbols - set(subset["symbol"].astype(str))):
+            print(
+                f"  Skipping {sym} ({prior_shares[sym]} shares) — "
+                "not in live priced basket."
+            )
+
+    print(
+        f"\nTop-up mode: {len(subset)} held name(s), "
+        f"weights re-normalized from live {source_type} {source_id}."
+    )
+    show = subset[["symbol", "name", "idx_weight"]].copy()
+    show["idx_weight"] = show["idx_weight"].map(lambda w: f"{w:.2f}%")
+    print(show.to_string(index=False))
+    print_switch_considerations(held_symbols, live_df)
+    return subset.reset_index(drop=True), prior_shares
+
+
+def run_topup_flow(
+    live_df: pd.DataFrame,
+    source_type: str,
+    source_id: str,
+    default_snapshot: str,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    prior = choose_topup_holdings_source(
+        default_snapshot, source_type, source_id
+    )
+    return run_topup_from_prior_shares(prior, live_df, source_type, source_id)
+
+
 def maybe_save_csv(plan: pd.DataFrame, default_name: str = "psx_sip_plan.csv") -> None:
     answer = prompt("\nSave full plan to CSV? [y/N]: ").lower()
     if answer not in ("y", "yes"):
@@ -1582,6 +2327,12 @@ def _finalize_sip_plan(
     scoped: pd.DataFrame,
     investment_pkr: float,
     default_csv: str = "psx_sip_plan.csv",
+    *,
+    source_type: str = "index",
+    source_id: str = "",
+    live_df: pd.DataFrame | None = None,
+    meta: dict | None = None,
+    prior_shares: dict[str, int] | None = None,
 ) -> None:
     cost_buffer_pct = prompt_non_negative_float(
         "Extra cost buffer on buy price (%)",
@@ -1596,6 +2347,24 @@ def _finalize_sip_plan(
     plan = compute_sip_plan(scoped, investment_pkr, use_board_lot, cost_buffer_pct)
     print_plan(plan, investment_pkr, use_board_lot, cost_buffer_pct)
     maybe_save_csv(plan, default_name=default_csv)
+    basket_df = live_df if live_df is not None else scoped
+    holdings_default = (
+        f"psx_sip_holdings_{source_id.lower()}.csv"
+        if source_id
+        else "psx_sip_holdings.csv"
+    )
+    maybe_save_holdings_snapshot(
+        plan,
+        basket_df,
+        source_type=source_type,
+        source_id=source_id,
+        investment_pkr=investment_pkr,
+        cost_buffer_pct=cost_buffer_pct,
+        use_board_lot=use_board_lot,
+        meta=meta,
+        prior_shares=prior_shares,
+        default_name=holdings_default,
+    )
 
 
 def run_index_flow() -> None:
@@ -1603,23 +2372,40 @@ def run_index_flow() -> None:
     df = load_index_frame(index_name)
     print_overview_tables(df, index_name)
 
+    mode = choose_sip_mode(index_name)
+    prior_shares: dict[str, int] | None = None
+    scoped: pd.DataFrame
+    if mode == "topup":
+        default_path = f"psx_sip_holdings_{index_name.lower()}.csv"
+        scoped, prior_shares = run_topup_flow(
+            df, "index", index_name, default_path
+        )
+    else:
+        exclude_sectors, exclude_symbols = prompt_exclusions(df)
+        filtered = apply_exclusions(df, exclude_sectors, exclude_symbols)
+        if filtered.empty:
+            print("All companies were excluded. Nothing to allocate.")
+            return
+        if len(filtered) < len(df):
+            print(
+                f"\nAfter exclusions: {len(filtered)} companies "
+                f"(removed {len(df) - len(filtered)})."
+            )
+        scoped = prompt_portfolio_scope(filtered, index_name)
+
     investment_pkr = prompt_positive_float(
         "\nMonthly SIP investment amount (PKR)"
     )
 
-    exclude_sectors, exclude_symbols = prompt_exclusions(df)
-    filtered = apply_exclusions(df, exclude_sectors, exclude_symbols)
-    if filtered.empty:
-        print("All companies were excluded. Nothing to allocate.")
-        return
-    if len(filtered) < len(df):
-        print(
-            f"\nAfter exclusions: {len(filtered)} companies "
-            f"(removed {len(df) - len(filtered)})."
-        )
-
-    scoped = prompt_portfolio_scope(filtered, index_name)
-    _finalize_sip_plan(scoped, investment_pkr)
+    _finalize_sip_plan(
+        scoped,
+        investment_pkr,
+        default_csv=f"psx_sip_plan_{index_name.lower()}.csv",
+        source_type="index",
+        source_id=index_name,
+        live_df=df,
+        prior_shares=prior_shares,
+    )
 
 
 def run_etf_flow() -> None:
@@ -1627,25 +2413,40 @@ def run_etf_flow() -> None:
     df, meta = load_etf_frame(etf_symbol)
     print_etf_overview(df, etf_symbol, meta)
 
+    mode = choose_sip_mode(etf_symbol)
+    prior_shares: dict[str, int] | None = None
+    scoped: pd.DataFrame
+    if mode == "topup":
+        default_path = f"psx_sip_holdings_{etf_symbol.lower()}.csv"
+        scoped, prior_shares = run_topup_flow(
+            df, "etf", etf_symbol, default_path
+        )
+    else:
+        exclude_sectors, exclude_symbols = prompt_exclusions(df)
+        filtered = apply_exclusions(df, exclude_sectors, exclude_symbols)
+        if filtered.empty:
+            print("All holdings were excluded. Nothing to allocate.")
+            return
+        if len(filtered) < len(df):
+            print(
+                f"\nAfter exclusions: {len(filtered)} holdings "
+                f"(removed {len(df) - len(filtered)})."
+            )
+        scoped = filtered
+
     investment_pkr = prompt_positive_float(
         "\nMonthly SIP investment amount (PKR)"
     )
 
-    exclude_sectors, exclude_symbols = prompt_exclusions(df)
-    filtered = apply_exclusions(df, exclude_sectors, exclude_symbols)
-    if filtered.empty:
-        print("All holdings were excluded. Nothing to allocate.")
-        return
-    if len(filtered) < len(df):
-        print(
-            f"\nAfter exclusions: {len(filtered)} holdings "
-            f"(removed {len(df) - len(filtered)})."
-        )
-
     _finalize_sip_plan(
-        filtered,
+        scoped,
         investment_pkr,
         default_csv=f"psx_sip_plan_{etf_symbol.lower()}.csv",
+        source_type="etf",
+        source_id=etf_symbol,
+        live_df=df,
+        meta=meta,
+        prior_shares=prior_shares,
     )
 
 
@@ -1653,6 +2454,7 @@ def main() -> None:
     print(f"PSX Index / ETF SIP Planner v{__version__} (psxdata)")
     print(f"Author: {__author__} · {__date__}")
     print("=" * 40)
+    print_startup_reminders()
 
     while True:
         product = choose_product_type()
