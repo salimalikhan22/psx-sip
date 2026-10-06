@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -99,7 +99,7 @@ _configure_psxdata()
 
 BOARD_LOT = 500
 DEFAULT_COST_BUFFER_PCT = 0.5
-HOLDINGS_SNAPSHOT_VERSION = "1"
+HOLDINGS_SNAPSHOT_VERSION = "2"
 MISSING_WEIGHT_ALERT_PCT = 3.0
 MISSING_TOP_N_ALERT = 10
 MISSING_TOTAL_WEIGHT_ALERT_PCT = 15.0
@@ -194,6 +194,38 @@ def _lookup_unit_price(
         return None
 
 
+def _fallback_price_from_history(symbol: str, lookback_days: int = 21) -> float | None:
+    """PSX screener omits some liquid names; use recent daily close from psxdata."""
+    sym = symbol.upper()
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=lookback_days)
+    try:
+        hist = psxdata.stocks(sym, start=start.isoformat(), end=end.isoformat())
+    except Exception:
+        return None
+    if hist is None or hist.empty or "close" not in hist.columns:
+        return None
+    hist = hist.sort_values("date")
+    try:
+        close = float(hist.iloc[-1]["close"])
+    except (ValueError, TypeError, IndexError):
+        return None
+    return close if close > 0 else None
+
+
+def _resolve_live_price(
+    symbol: str, scr: pd.DataFrame, price_col: str
+) -> tuple[float | None, str]:
+    sym = symbol.upper()
+    price = _lookup_unit_price(sym, scr, price_col)
+    if price is not None:
+        return price, "screener"
+    price = _fallback_price_from_history(sym)
+    if price is not None:
+        return price, "history"
+    return None, ""
+
+
 def _format_etf_unit_price(price: float | None) -> str:
     if price is None:
         return "ETF price: N/A"
@@ -261,17 +293,15 @@ def _build_etf_frame_from_parsed(
 ) -> tuple[pd.DataFrame, dict]:
     rows: list[dict] = []
     missing_prices: list[str] = []
+    history_priced: list[str] = []
     for h in parsed["holdings"]:
         sym = h["symbol"]
-        if sym not in scr.index:
+        price, source = _resolve_live_price(sym, scr, price_col)
+        if price is None:
             missing_prices.append(sym)
             continue
-        scr_row = scr.loc[sym]
-        try:
-            price = parse_price(scr_row[price_col])
-        except ValueError:
-            missing_prices.append(sym)
-            continue
+        if source == "history":
+            history_priced.append(sym)
         sector = sector_by_symbol.get(sym, "")
         value = h["basket_shares"] * price
         rows.append(
@@ -285,8 +315,13 @@ def _build_etf_frame_from_parsed(
             }
         )
 
+    if history_priced and not quiet:
+        print(
+            "  Note: price from recent PSX daily close (not in live screener): "
+            + ", ".join(history_priced)
+        )
     if missing_prices and not quiet:
-        print(f"  Warning: no live price for: {', '.join(missing_prices)}")
+        print(f"  Warning: no price for: {', '.join(missing_prices)}")
 
     if not rows:
         raise ValueError("no priced holdings")
@@ -310,6 +345,7 @@ def _build_etf_frame_from_parsed(
         "title": parsed["title"],
         "missing_price_symbols": list(missing_prices),
         "parsed_holdings": list(parsed["holdings"]),
+        "history_priced_symbols": list(history_priced),
     }
     return (
         df.sort_values("idx_weight", ascending=False).reset_index(drop=True),
@@ -1044,6 +1080,25 @@ def print_etf_overview(df: pd.DataFrame, etf_symbol: str, meta: dict) -> None:
         print(f"  {_format_etf_unit_price(unit_price)} (PSX quote)")
     if meta.get("as_of"):
         print(f"  Basket as of {meta['as_of']} ({meta.get('title', '')})")
+    parsed = meta.get("parsed_holdings") or []
+    pub_n = len(parsed)
+    if pub_n:
+        print(
+            f"  PSX published basket: {pub_n} equity names | "
+            f"in this table: {len(df)}"
+        )
+    hist = meta.get("history_priced_symbols") or []
+    if hist:
+        print(
+            "  Recent daily close used (symbol not in live screener): "
+            + ", ".join(hist)
+        )
+    missing = meta.get("missing_price_symbols") or []
+    if missing:
+        print(
+            "  No price available (in PSX basket but omitted from SIP math): "
+            + ", ".join(missing)
+        )
     print(f"{'=' * 72}\n")
 
     show = df.copy()
@@ -1304,9 +1359,14 @@ def load_index_frame(index_name: str) -> tuple[pd.DataFrame, dict]:
             {"symbol": sym, "name": name, "basket_shares": None}
         )
         weight = pd.to_numeric(row.get("idx_weight"), errors="coerce")
+        price: float | None = None
         try:
             price = parse_price(row["current"])
         except ValueError:
+            price = None
+        if price is None:
+            price = _fallback_price_from_history(sym)
+        if price is None:
             missing_price_symbols.append(sym)
             continue
         if weight is None or (isinstance(weight, float) and math.isnan(weight)):
@@ -1759,14 +1819,12 @@ def build_holdings_snapshot_rows(
         notes: str,
     ) -> dict:
         sym = symbol.upper()
-        shares_this = int(plan_by_sym.loc[sym, "shares"]) if sym in plan_by_sym.index else 0
+        shares_add = int(plan_by_sym.loc[sym, "shares"]) if sym in plan_by_sym.index else 0
         invested_this = (
             float(plan_by_sym.loc[sym, "invested_pkr"]) if sym in plan_by_sym.index else 0.0
         )
-        if sym in prior:
-            shares_held = int(prior[sym]) + shares_this
-        else:
-            shares_held = shares_this
+        shares_before = int(prior.get(sym, 0))
+        shares_total = shares_before + shares_add
         return {
             "symbol": sym,
             "name": name,
@@ -1774,8 +1832,9 @@ def build_holdings_snapshot_rows(
             "basket_shares": basket_shares,
             "price": price,
             "idx_weight_pct": idx_weight,
-            "shares_held": shares_held,
-            "shares_this_run": shares_this,
+            "shares_before_run": shares_before,
+            "shares_to_add_this_run": shares_add,
+            "shares_held": shares_total,
             "invested_pkr_this_run": invested_this,
             "data_status": data_status,
             "notes": notes,
@@ -1893,7 +1952,10 @@ def write_holdings_snapshot(
         val = str(header[key]).replace("\n", " ")
         lines.append(f"# {key}={val}")
     lines.append(
-        "# Edit shares_held between runs if you bought outside this planner."
+        "# shares_before_run + shares_to_add_this_run = shares_held (use shares_held next top-up)."
+    )
+    lines.append(
+        "# Edit shares_held only if you traded outside this planner."
     )
     lines.append(
         "# Pass this file on the next SIP as your last holdings snapshot."
@@ -1904,6 +1966,87 @@ def write_holdings_snapshot(
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
         table.to_csv(fh, index=False)
+
+
+def _coerce_share_counts(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").fillna(0).astype(int)
+
+
+def normalize_holdings_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Accept legacy snapshots/plan CSVs with varying column names."""
+    out = df.copy()
+    if "symbol" not in out.columns:
+        print("  File must include a 'symbol' column.")
+        sys.exit(1)
+    out["symbol"] = out["symbol"].astype(str).str.upper().str.strip()
+
+    legacy_note: list[str] = []
+
+    if "shares_to_add_this_run" not in out.columns and "shares_this_run" in out.columns:
+        out["shares_to_add_this_run"] = _coerce_share_counts(out["shares_this_run"])
+        legacy_note.append("shares_this_run → shares_to_add_this_run (display only)")
+
+    if "shares_before_run" in out.columns:
+        out["shares_before_run"] = _coerce_share_counts(out["shares_before_run"])
+    else:
+        out["shares_before_run"] = 0
+
+    if "shares_to_add_this_run" in out.columns:
+        out["shares_to_add_this_run"] = _coerce_share_counts(
+            out["shares_to_add_this_run"]
+        )
+
+    if "shares_held" in out.columns:
+        out["shares_held"] = _coerce_share_counts(out["shares_held"])
+    elif "shares_held_total" in out.columns:
+        out["shares_held"] = _coerce_share_counts(out["shares_held_total"])
+        legacy_note.append("shares_held_total → shares_held")
+    elif (
+        "shares_before_run" in out.columns
+        and "shares_to_add_this_run" in out.columns
+    ):
+        out["shares_held"] = out["shares_before_run"] + out["shares_to_add_this_run"]
+        legacy_note.append("computed shares_held from before + add columns")
+    elif "shares" in out.columns:
+        out["shares_held"] = _coerce_share_counts(out["shares"])
+        legacy_note.append("plan-style 'shares' used as shares_held (position totals)")
+    else:
+        print(
+            "  Could not find share counts. Need one of: shares_held, "
+            "shares_held_total, shares, or shares_before_run + shares_to_add_this_run."
+        )
+        sys.exit(1)
+
+    if int(out["shares_held"].sum()) == 0:
+        if "shares_to_add_this_run" in out.columns and int(
+            out["shares_to_add_this_run"].sum()
+        ) > 0:
+            out["shares_held"] = out["shares_to_add_this_run"]
+            legacy_note.append(
+                "no shares_held totals — using shares_to_add_this_run as position"
+            )
+        elif "shares" in out.columns and int(_coerce_share_counts(out["shares"]).sum()) > 0:
+            out["shares_held"] = _coerce_share_counts(out["shares"])
+            legacy_note.append("using 'shares' column as position")
+
+    if legacy_note:
+        print("  Legacy / simplified file: " + "; ".join(legacy_note))
+
+    return out
+
+
+def prior_shares_from_holdings_df(df: pd.DataFrame) -> dict[str, int]:
+    norm = normalize_holdings_dataframe(df)
+    held = norm[norm["shares_held"] > 0]
+    if held.empty:
+        return {}
+    return (
+        held.groupby("symbol", as_index=False)["shares_held"]
+        .max()
+        .set_index("symbol")["shares_held"]
+        .astype(int)
+        .to_dict()
+    )
 
 
 def load_holdings_snapshot(path: str) -> tuple[dict[str, str], pd.DataFrame]:
@@ -1920,9 +2063,10 @@ def load_holdings_snapshot(path: str) -> tuple[dict[str, str], pd.DataFrame]:
                     header[parsed[0]] = parsed[1]
                 continue
             data_lines.append(line)
-    if header.get("snapshot_version") not in (None, HOLDINGS_SNAPSHOT_VERSION):
+    snap_ver = header.get("snapshot_version")
+    if snap_ver not in (None, "1", HOLDINGS_SNAPSHOT_VERSION):
         print(
-            f"  Warning: snapshot version {header.get('snapshot_version')} "
+            f"  Warning: snapshot version {snap_ver} "
             f"(planner expects {HOLDINGS_SNAPSHOT_VERSION})."
         )
     from io import StringIO
@@ -1930,13 +2074,7 @@ def load_holdings_snapshot(path: str) -> tuple[dict[str, str], pd.DataFrame]:
     if not data_lines or not data_lines[0].strip():
         print("  Holdings file has no data rows.")
         sys.exit(1)
-    df = pd.read_csv(StringIO("".join(data_lines)))
-    required = {"symbol", "shares_held"}
-    if not required.issubset(df.columns):
-        print(f"  Holdings file must include columns: {', '.join(sorted(required))}")
-        sys.exit(1)
-    df["symbol"] = df["symbol"].astype(str).str.upper()
-    df["shares_held"] = pd.to_numeric(df["shares_held"], errors="coerce").fillna(0).astype(int)
+    df = normalize_holdings_dataframe(pd.read_csv(StringIO("".join(data_lines))))
     return header, df
 
 
@@ -1972,16 +2110,39 @@ def maybe_save_holdings_snapshot(
         missing_price_symbols=missing,
         prior_shares=prior_shares,
     )
+    adds = table["shares_to_add_this_run"].sum() if "shares_to_add_this_run" in table.columns else 0
+    inv = table["invested_pkr_this_run"].sum() if "invested_pkr_this_run" in table.columns else 0
     snap_header = {
         "planner_version": __version__,
         "generated_at": _utc_now_iso(),
         "source_type": source_type,
         "source_id": source_id,
         "investment_pkr_this_run": f"{investment_pkr:.2f}",
+        "total_shares_added_this_run": str(int(adds)),
+        "total_invested_pkr_this_run": f"{float(inv):.2f}",
         "cost_buffer_pct": f"{cost_buffer_pct:.2f}",
         "board_lot": "yes" if use_board_lot else "no",
         "basket_as_of": str((meta or {}).get("as_of", "")),
     }
+    action = table[table["shares_to_add_this_run"] > 0].copy()
+    if not action.empty:
+        show = action[
+            [
+                "symbol",
+                "shares_before_run",
+                "shares_to_add_this_run",
+                "shares_held",
+                "invested_pkr_this_run",
+            ]
+        ]
+        print("\n  This top-up / plan — buy this run (also stored in the CSV):")
+        print(show.to_string(index=False))
+        print(
+            f"\n  Run totals: +{int(action['shares_to_add_this_run'].sum())} shares, "
+            f"PKR {action['invested_pkr_this_run'].sum():,.2f} invested "
+            f"(→ shares_held column is your cumulative total for the next run)."
+        )
+
     write_holdings_snapshot(path, table, snap_header)
     abs_path = os.path.abspath(path)
     print(f"Saved holdings snapshot: {abs_path}")
@@ -2366,28 +2527,16 @@ def prompt_manual_holdings() -> dict[str, int]:
 
 def load_prior_shares_from_plan_csv(path: str) -> dict[str, int]:
     df = pd.read_csv(path)
-    if "symbol" not in df.columns:
-        print("  Plan CSV must include a 'symbol' column.")
+    prior = prior_shares_from_holdings_df(df)
+    if not prior:
+        print("  No rows with share count > 0 in that CSV.")
         sys.exit(1)
-    df["symbol"] = df["symbol"].astype(str).str.upper()
-    if "shares_held" in df.columns:
-        qty_col = "shares_held"
-    elif "shares" in df.columns:
-        qty_col = "shares"
+    if "shares" in df.columns and "shares_held" not in df.columns:
         print(
-            "\n  Note: using the plan's 'shares' column as your position. "
-            "That is only one month's buys unless you edited the file — "
-            "adjust totals if needed before saving a new snapshot."
+            "\n  Note: using 'shares' as your position — often one month's buys only; "
+            "edit or save a v2 holdings snapshot for cumulative totals."
         )
-    else:
-        print("  Plan CSV needs 'shares_held' or 'shares'.")
-        sys.exit(1)
-    df[qty_col] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0).astype(int)
-    df = df[df[qty_col] > 0]
-    if df.empty:
-        print("  No rows with share count > 0 in that plan CSV.")
-        sys.exit(1)
-    return df.groupby("symbol")[qty_col].sum().astype(int).to_dict()
+    return prior
 
 
 def _is_holdings_snapshot_file(path: str) -> bool:
@@ -2417,14 +2566,11 @@ def _load_prior_shares_from_any_csv(
     if use_snapshot:
         header, snap = load_holdings_snapshot(path)
         _warn_if_snapshot_mismatch(header, source_type, source_id)
-        held = snap[snap["shares_held"] > 0]
-        if held.empty:
+        prior = prior_shares_from_holdings_df(snap)
+        if not prior:
             print("  No shares_held > 0 in the holdings file.")
             sys.exit(1)
-        return {
-            str(r["symbol"]).upper(): int(r["shares_held"])
-            for _, r in held.iterrows()
-        }
+        return prior
     if use_plan:
         return load_prior_shares_from_plan_csv(path)
     print(f"  Unknown PSX_SIP_HOLDINGS_KIND={kind!r} (use auto, snapshot, or plan).")
