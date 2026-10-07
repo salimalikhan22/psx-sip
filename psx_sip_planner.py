@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Interactive PSX index / ETF SIP planner and market insights using psxdata.
 
-Author: Salim Ali Khan · Version 1.2.1 · October 2026
+Author: Salim Ali Khan · Version 1.2.2 · October 2026
 
 Privacy: this script does not upload your holdings or plans. It only reads/writes
 files you choose locally and fetches public PSX market data (see README).
@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -77,7 +77,7 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import psxdata
 from bs4 import BeautifulSoup
-from psxdata.constants import BASE_URL, COLUMN_MAP, INDEX_NAMES
+from psxdata.constants import BASE_URL, COLUMN_MAP, INDEX_NAMES, REQUEST_HEADERS
 from psxdata.parsers.html import parse_html_table
 from psxdata.parsers.normalizers import coerce_numeric
 from psxdata.scrapers.base import BaseScraper
@@ -1530,6 +1530,122 @@ def _rank_score(series: pd.Series) -> pd.Series:
     return (s - lo) / (hi - lo)
 
 
+_company_annual_eps_cache: dict[str, list[float]] = {}
+_ANNUAL_YEAR_RE = re.compile(r"^20\d{2}$")
+
+
+def _fetch_company_page_html(symbol: str) -> str:
+    sym = symbol.upper()
+    scraper = _get_etf_scraper()
+    url = f"{BASE_URL}/company/{sym}"
+    resp = scraper._request("GET", url, headers=dict(REQUEST_HEADERS))
+    return resp.text
+
+
+def _parse_company_annual_eps(html: str) -> list[float]:
+    """Newest annual EPS first (from PSX /company/SYM highlights table)."""
+    soup = BeautifulSoup(html, "html.parser")
+    for table in soup.select("table"):
+        rows = table.select("tr")
+        if not rows:
+            continue
+        header_cells = rows[0].find_all(["th", "td"])
+        headers = [c.get_text(strip=True) for c in header_cells]
+        if not headers or headers[0] not in ("", "Metric"):
+            continue
+        year_cols = headers[1:]
+        if len(year_cols) < 2 or not _ANNUAL_YEAR_RE.match(str(year_cols[0])):
+            continue
+        for tr in rows[1:]:
+            cells = [c.get_text(strip=True) for c in tr.select("td")]
+            if not cells or cells[0].strip().upper() != "EPS":
+                continue
+            pairs: list[tuple[int, float]] = []
+            for year_s, raw in zip(year_cols, cells[1:]):
+                if not _ANNUAL_YEAR_RE.match(str(year_s)):
+                    continue
+                val = coerce_numeric(str(raw).replace(",", ""))
+                if val is None:
+                    continue
+                pairs.append((int(year_s), float(val)))
+            if not pairs:
+                continue
+            pairs.sort(key=lambda p: p[0], reverse=True)
+            return [v for _y, v in pairs]
+    return []
+
+
+def _company_annual_eps_values(symbol: str) -> list[float]:
+    sym = symbol.upper()
+    if sym in _company_annual_eps_cache:
+        return _company_annual_eps_cache[sym]
+    try:
+        html = _fetch_company_page_html(sym)
+        values = _parse_company_annual_eps(html)
+    except Exception:
+        values = []
+    _company_annual_eps_cache[sym] = values
+    return values
+
+
+def _consecutive_eps_decline(values: list[float], years: int) -> bool:
+    if len(values) < years or years < 2:
+        return False
+    for i in range(years - 1):
+        if values[i] >= values[i + 1]:
+            return False
+    return True
+
+
+def _describe_eps_trend(values: list[float]) -> tuple[str, bool]:
+    """Human label and whether to exclude (multi-year EPS slide)."""
+    if len(values) < 2:
+        return ("EPS n/a", False)
+    if _consecutive_eps_decline(values, 3):
+        return ("EPS ↓ 3 yrs", True)
+    if _consecutive_eps_decline(values, 2):
+        return ("EPS ↓ 2 yrs", True)
+    if len(values) >= 3 and values[0] > values[1] > values[2]:
+        return ("EPS ↑ 3 yrs", False)
+    oldest = values[-1]
+    if oldest and abs(oldest) > 1e-9:
+        ch = (values[0] - oldest) / abs(oldest) * 100.0
+        if ch >= 5:
+            return (f"EPS +{ch:.0f}% vs {len(values)-1}y ago", False)
+        if ch <= -5:
+            return (f"EPS {ch:.0f}% vs {len(values)-1}y ago", False)
+    return ("EPS mixed", False)
+
+
+def _eps_growth_factor(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    oldest = values[-1]
+    if not oldest or abs(oldest) < 1e-9:
+        return 0.0
+    return (values[0] - oldest) / abs(oldest) * 100.0
+
+
+def _basket_role_label(
+    blue_r: float,
+    div_r: float,
+    growth_r: float,
+    w_blue: float,
+    w_div: float,
+    w_growth: float,
+) -> str:
+    weighted = {
+        "blue-chip": w_blue * blue_r,
+        "dividend": w_div * div_r,
+        "growth": w_growth * growth_r,
+    }
+    ranked = sorted(weighted.items(), key=lambda kv: kv[1], reverse=True)
+    tags = [ranked[0][0]]
+    if len(ranked) > 1 and ranked[1][1] >= ranked[0][1] * 0.82:
+        tags.append(ranked[1][0])
+    return "+".join(tags)
+
+
 def _index_constituent_weights(index_name: str) -> pd.DataFrame:
     raw = fetch_indices(index_name)
     if raw is None or raw.empty or "symbol" not in raw.columns:
@@ -1648,6 +1764,7 @@ def build_smart_custom_basket(
     target_count: int,
     min_div_yield: float,
     max_per_sector: int,
+    exclude_eps_decliners: bool = True,
 ) -> pd.DataFrame:
     print("\nFetching index weights, screener, and prices...")
     blue_weight: dict[str, float] = {}
@@ -1686,11 +1803,55 @@ def build_smart_custom_basket(
             sys.exit(1)
         print(f"  Dividend filter ≥ {min_div_yield:g}%: {len(scr)} names remain.")
 
-    scr["score"] = (
-        w_blue * _rank_score(scr["blue_chip_score"])
-        + w_div * _rank_score(scr["dividend_yield"])
-        + w_growth * _rank_score(scr["change_1y_pct"])
+    n_eps = len(scr)
+    print(
+        f"  Reading annual EPS from PSX company pages ({n_eps} names)…"
     )
+    eps_notes: list[str] = []
+    eps_factors: list[float] = []
+    eps_exclude: list[bool] = []
+    skipped_eps: list[str] = []
+    for i, sym in enumerate(scr["symbol"].astype(str).str.upper(), start=1):
+        if i == 1 or i == n_eps or i % 20 == 0:
+            print(f"    … {i}/{n_eps}", flush=True)
+        eps_vals = _company_annual_eps_values(sym)
+        note, exclude = _describe_eps_trend(eps_vals)
+        eps_notes.append(note)
+        eps_factors.append(_eps_growth_factor(eps_vals))
+        if exclude_eps_decliners and exclude:
+            skipped_eps.append(f"{sym} ({note})")
+            eps_exclude.append(True)
+        else:
+            eps_exclude.append(False)
+
+    scr = scr.copy()
+    scr["eps_trend"] = eps_notes
+    scr["eps_growth_pct"] = eps_factors
+    if exclude_eps_decliners and skipped_eps:
+        scr = scr[~pd.Series(eps_exclude, index=scr.index)].copy()
+        print(
+            f"  Excluded {len(skipped_eps)} name(s) with multi-year EPS declines "
+            f"(e.g. {', '.join(skipped_eps[:4])}"
+            + (" …" if len(skipped_eps) > 4 else "")
+            + ")."
+        )
+    if scr.empty:
+        print("  No names left after EPS filter. Try turning the EPS filter off.")
+        sys.exit(1)
+
+    blue_r = _rank_score(scr["blue_chip_score"])
+    div_r = _rank_score(scr["dividend_yield"])
+    price_growth_r = _rank_score(scr["change_1y_pct"])
+    eps_growth_r = _rank_score(scr["eps_growth_pct"])
+    growth_r = (price_growth_r + eps_growth_r) / 2.0
+
+    scr["score"] = (
+        w_blue * blue_r + w_div * div_r + w_growth * growth_r
+    )
+    scr["basket_role"] = [
+        _basket_role_label(b, d, g, w_blue, w_div, w_growth)
+        for b, d, g in zip(blue_r, div_r, growth_r)
+    ]
     scr = scr.sort_values("score", ascending=False)
 
     picked: list[pd.Series] = []
@@ -1707,6 +1868,11 @@ def build_smart_custom_basket(
     if not picked:
         print("  Could not pick any stocks (check filters).")
         sys.exit(1)
+    if len(picked) < target_count:
+        print(
+            f"  Note: only {len(picked)} names available "
+            f"(asked for {target_count}) after sector/EPS filters."
+        )
 
     sel = pd.DataFrame(picked)
     price_ok: list[dict] = []
@@ -1727,6 +1893,8 @@ def build_smart_custom_basket(
                 "dividend_yield": float(row.get("dividend_yield", 0.0)),
                 "change_1y_pct": float(row.get("change_1y_pct", 0.0)),
                 "blue_chip_score": float(row.get("blue_chip_score", 0.0)),
+                "basket_role": str(row.get("basket_role", "")),
+                "eps_trend": str(row.get("eps_trend", "")),
             }
         )
 
@@ -1762,6 +1930,10 @@ def run_custom_basket_flow() -> None:
     min_div = prompt_non_negative_float(
         "Minimum dividend yield % (0 = no filter)", 0.0
     )
+    eps_filter = prompt(
+        "Drop names with annual EPS down 2+ years in a row (PSX data)? [Y/n]: "
+    ).lower()
+    exclude_eps = eps_filter not in ("n", "no")
     basket_id = prompt("Basket label for files [smart_basket]: ").strip() or "smart_basket"
     basket_id = re.sub(r"[^\w\-]+", "_", basket_id)[:40]
 
@@ -1774,6 +1946,7 @@ def run_custom_basket_flow() -> None:
         target_count=target_count,
         min_div_yield=min_div,
         max_per_sector=CUSTOM_BASKET_MAX_PER_SECTOR,
+        exclude_eps_decliners=exclude_eps,
     )
 
     print(f"\n{'=' * 72}")
@@ -1783,10 +1956,16 @@ def run_custom_basket_flow() -> None:
         f"{w_growth*100:.0f}% 1y"
     )
     print(f"{'=' * 72}\n")
+    print(
+        "  basket_role: why the name scored well (blue-chip / dividend / growth). "
+        "eps_trend: annual EPS path from PSX company page."
+    )
     show = df[
         [
             "symbol",
             "name",
+            "basket_role",
+            "eps_trend",
             "sector_name",
             "price",
             "idx_weight",
@@ -1798,7 +1977,13 @@ def run_custom_basket_flow() -> None:
     show["idx_weight"] = show["idx_weight"].map(lambda w: f"{w:.2f}%")
     show["dividend_yield"] = show["dividend_yield"].map(lambda v: f"{v:.2f}%")
     show["change_1y_pct"] = show["change_1y_pct"].map(lambda v: f"{v:+.1f}%")
-    show = show.rename(columns={"idx_weight": "target_weight", "change_1y_pct": "1y_chg"})
+    show = show.rename(
+        columns={
+            "idx_weight": "target_weight",
+            "change_1y_pct": "1y_price",
+            "basket_role": "role",
+        }
+    )
     print(show.to_string(index=False))
 
     confirm = prompt("\nUse this basket for SIP planning? [Y/n]: ").lower()
