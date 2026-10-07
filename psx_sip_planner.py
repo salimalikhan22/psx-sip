@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Interactive PSX index / ETF SIP planner and market insights using psxdata.
 
-Author: Salim Ali Khan · Version 1.1.0 · October 2026
+Author: Salim Ali Khan · Version 1.2.0 · October 2026
 
 Privacy: this script does not upload your holdings or plans. It only reads/writes
 files you choose locally and fetches public PSX market data (see README).
@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.1.4"
+__version__ = "1.2.0"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -150,6 +150,9 @@ HOLDINGS_SNAPSHOT_VERSION = "2"
 MISSING_WEIGHT_ALERT_PCT = 3.0
 MISSING_TOP_N_ALERT = 10
 MISSING_TOTAL_WEIGHT_ALERT_PCT = 15.0
+BASKET_WEIGHT_DRIFT_PP = 1.0
+CUSTOM_BASKET_DEFAULT_COUNT = 12
+CUSTOM_BASKET_MAX_PER_SECTOR = 3
 _ETF_BASKET_UNIT_RE = re.compile(r"Per\s+([\d,]+)\s+ETF\s+Units", re.I)
 _ETF_CASH_RE = re.compile(r"Cash Component:\s*Rs\.?\s*([\d,]+(?:\.\d+)?)", re.I)
 _ETF_CASH_PCT_RE = re.compile(
@@ -797,6 +800,7 @@ def run_insights_flow() -> None:
         print("Fetching sector screener and breadth...\n")
         stock_stats, breadth = _sector_performance_insights()
         _print_sector_insights(stock_stats, breadth)
+        maybe_export_insights_tables([], [], stock_stats)
         return
 
     if scope in ("indices", "etfs", "mix"):
@@ -834,6 +838,7 @@ def run_insights_flow() -> None:
             if len(etf_rows) == 1:
                 title = f"PSX ETF — {etf_rows[0]['symbol']} (levels and period highs)"
             _print_insights_market_table(title, etf_rows)
+        maybe_export_insights_tables(index_rows, etf_rows)
         return
 
     print("Fetching market snapshot and historical highs (this may take a minute)...\n")
@@ -853,6 +858,32 @@ def run_insights_flow() -> None:
     _print_insights_market_table("PSX indices — levels and period highs", index_rows)
     _print_insights_market_table("PSX ETFs — prices and period highs", etf_rows)
     _print_sector_insights(stock_stats, breadth)
+    maybe_export_insights_tables(index_rows, etf_rows, stock_stats)
+
+
+def maybe_export_insights_tables(
+    index_rows: list[dict],
+    etf_rows: list[dict],
+    stock_stats: pd.DataFrame | None = None,
+) -> None:
+    if not index_rows and not etf_rows and (stock_stats is None or stock_stats.empty):
+        return
+    answer = prompt("\nExport insights to CSV? [y/N]: ").lower()
+    if answer not in ("y", "yes"):
+        return
+    path = prompt("File name [psx_sip_insights.csv]: ") or "psx_sip_insights.csv"
+    path = resolve_user_path(path)
+    parts: list[pd.DataFrame] = []
+    if index_rows:
+        parts.append(pd.DataFrame(index_rows).assign(table="index"))
+    if etf_rows:
+        parts.append(pd.DataFrame(etf_rows).assign(table="etf"))
+    if stock_stats is not None and not stock_stats.empty:
+        parts.append(stock_stats.assign(table="sector_pulse"))
+    if not parts:
+        return
+    pd.concat(parts, ignore_index=True).to_csv(path, index=False)
+    print(f"Saved: {path}")
 
 
 def _local_state_enabled() -> bool:
@@ -897,7 +928,9 @@ def print_usage_tips() -> None:
         """
 Quick reference (type h or ? at any menu):
   • Index & ETF (menus 1 & 2): new plan, top-up, scope, exclusions, snapshots.
-  • Next SIP: pick 1 or 2 → SIP mode 2 Top-up → enter CSV path (any name).
+  • Custom basket (menu 5): blue-chip pool + dividend + 1y blend — not one index/ETF.
+  • Top-up: mode 2 → then 1 held weights / 2 equal split / 3 benchmark gap-fill.
+  • Snapshot load shows basket drift (new/dropped names, weight shifts).
   • Match check (menu 4): Index or ETF → CSV or SYMBOL:qty → resemblance %.
   • Paths: relative (from cwd), absolute, or ~/file.csv — all work.
   • Env: PSX_SIP_HOLDINGS=/path/to.csv skips the load menu in top-up.
@@ -947,6 +980,9 @@ def choose_product_type() -> str:
         "  4. Compare my holdings to an index/ETF "
         "(CSV or shares — how close am I?)"
     )
+    print(
+        "  5. Custom basket SIP (blue-chip + dividend + growth blend)"
+    )
     print("  h. Help (shortcuts)")
     print()
     while True:
@@ -962,7 +998,9 @@ def choose_product_type() -> str:
             return "insights"
         if choice in ("4", "compare", "match", "align", "holdings"):
             return "align"
-        print("  Enter 1, 2, 3, 4, or h.")
+        if choice in ("5", "custom", "basket", "smart", "blend"):
+            return "custom"
+        print("  Enter 1, 2, 3, 4, 5, or h.")
 
 
 def prompt_return_to_menu() -> bool:
@@ -1478,6 +1516,313 @@ def load_index_frame(index_name: str) -> tuple[pd.DataFrame, dict]:
     return df.reset_index(drop=True), meta
 
 
+def _rank_score(series: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    if s.notna().sum() == 0:
+        return pd.Series(0.0, index=series.index)
+    lo = float(s.min())
+    hi = float(s.max())
+    if hi <= lo:
+        return pd.Series(0.5, index=series.index)
+    return (s - lo) / (hi - lo)
+
+
+def _index_constituent_weights(index_name: str) -> pd.DataFrame:
+    raw = fetch_indices(index_name)
+    if raw is None or raw.empty or "symbol" not in raw.columns:
+        return pd.DataFrame(columns=["symbol", "idx_weight"])
+    out = raw[["symbol"]].copy()
+    out["symbol"] = out["symbol"].astype(str).str.upper()
+    out["idx_weight"] = pd.to_numeric(raw.get("idx_weight"), errors="coerce").fillna(0.0)
+    return out.groupby("symbol", as_index=False)["idx_weight"].max()
+
+
+def _etf_constituent_symbols(etf_symbols: list[str]) -> set[str]:
+    found: set[str] = set()
+    for sym in etf_symbols:
+        parsed, _html = _fetch_etf_parsed(sym.upper())
+        if not parsed or parsed.get("kind") != "equity":
+            continue
+        for h in parsed.get("holdings") or []:
+            found.add(str(h["symbol"]).upper())
+    return found
+
+
+def _build_screener_enriched() -> pd.DataFrame:
+    scr = fetch_screener()
+    if scr.empty or "symbol" not in scr.columns:
+        print("  PSX screener unavailable; cannot build custom basket.")
+        sys.exit(1)
+    out = scr.copy()
+    out["symbol"] = out["symbol"].astype(str).str.upper()
+    sym_meta = fetch_symbols()
+    if "sector_name" in sym_meta.columns:
+        out = out.merge(
+            sym_meta[["symbol", "sector_name", "name"]],
+            on="symbol",
+            how="left",
+            suffixes=("", "_sym"),
+        )
+        if "name_sym" in out.columns:
+            out["name"] = out["name"].fillna(out["name_sym"])
+            out = out.drop(columns=["name_sym"], errors="ignore")
+    else:
+        out["sector_name"] = out.get("sector", "")
+        out["name"] = out["symbol"]
+    out["sector_name"] = out["sector_name"].fillna("UNKNOWN").astype(str)
+    out["price"] = pd.to_numeric(
+        out.get("price", out.get("current")), errors="coerce"
+    )
+    out["dividend_yield"] = pd.to_numeric(
+        out.get("dividend_yield"), errors="coerce"
+    ).fillna(0.0)
+    out["change_1y_pct"] = pd.to_numeric(
+        out.get("change_1y_pct"), errors="coerce"
+    ).fillna(0.0)
+    out["market_cap"] = pd.to_numeric(out.get("market_cap"), errors="coerce").fillna(0.0)
+    return out
+
+
+def choose_custom_basket_pool() -> tuple[list[str], list[str]]:
+    print("\nBuild candidate pool from:\n")
+    print("  1. KSE100 constituents only")
+    print("  2. KSE100 + KSE30 (union — larger blue-chip pool)")
+    print("  3. KSE100 + KSE30 + selected ETF equity baskets")
+    print()
+    while True:
+        choice = prompt("Select [2]: ") or "2"
+        if choice in ("1", "kse100", "100"):
+            return (["KSE100"], [])
+        if choice in ("2", "both", "30"):
+            return (["KSE100", "KSE30"], [])
+        if choice in ("3", "etf", "mix"):
+            etfs = choose_etfs_multi(allow_empty=False)
+            return (["KSE100", "KSE30"], [s for s, _ in etfs])
+        print("  Enter 1, 2, or 3.")
+
+
+def choose_custom_basket_blend() -> tuple[float, float, float]:
+    print(
+        "\nBlend (must sum to 100%) — index blue-chip weight, "
+        "dividend yield, 1y momentum:\n"
+    )
+    print("  1. Balanced — 40% blue chip / 30% dividend / 30% growth")
+    print("  2. Income tilt — 20% / 50% / 30%")
+    print("  3. Growth tilt — 50% / 20% / 30%")
+    print("  4. Enter custom percentages")
+    presets = {
+        "1": (40.0, 30.0, 30.0),
+        "2": (20.0, 50.0, 30.0),
+        "3": (50.0, 20.0, 30.0),
+    }
+    while True:
+        choice = prompt("Select [1]: ") or "1"
+        if choice in presets:
+            a, b, c = presets[choice]
+            return a / 100.0, b / 100.0, c / 100.0
+        if choice in ("4", "custom", "c"):
+            blue = prompt_non_negative_float("Blue-chip weight %", 40.0)
+            div = prompt_non_negative_float("Dividend weight %", 30.0)
+            gr = prompt_non_negative_float("Growth (1y) weight %", 30.0)
+            total = blue + div + gr
+            if total <= 0:
+                print("  Weights must be > 0.")
+                continue
+            if abs(total - 100.0) > 0.5:
+                print(f"  Sum is {total:.1f}% — re-normalizing to 100%.")
+            scale = 100.0 / total
+            return blue * scale / 100.0, div * scale / 100.0, gr * scale / 100.0
+        print("  Enter 1–4.")
+
+
+def build_smart_custom_basket(
+    index_names: list[str],
+    etf_symbols: list[str],
+    *,
+    w_blue: float,
+    w_div: float,
+    w_growth: float,
+    target_count: int,
+    min_div_yield: float,
+    max_per_sector: int,
+) -> pd.DataFrame:
+    print("\nFetching index weights, screener, and prices...")
+    blue_weight: dict[str, float] = {}
+    for iname in index_names:
+        chunk = _index_constituent_weights(iname)
+        for _, row in chunk.iterrows():
+            sym = str(row["symbol"]).upper()
+            w = float(row["idx_weight"])
+            blue_weight[sym] = max(blue_weight.get(sym, 0.0), w)
+
+    etf_syms = _etf_constituent_symbols(etf_symbols) if etf_symbols else set()
+    pool = set(blue_weight.keys()) | etf_syms
+    if not pool:
+        print("  Empty candidate pool.")
+        sys.exit(1)
+
+    scr = _build_screener_enriched()
+    scr = scr[scr["symbol"].isin(pool)].copy()
+    if scr.empty:
+        print("  No screener overlap with index/ETF pool.")
+        sys.exit(1)
+
+    scr["blue_chip_score"] = scr["symbol"].map(lambda s: blue_weight.get(s, 0.0))
+    if etf_syms:
+        scr["etf_member"] = scr["symbol"].isin(etf_syms).astype(float)
+        scr["blue_chip_score"] = scr["blue_chip_score"] + scr["etf_member"] * 0.5
+
+    if min_div_yield > 0:
+        before = len(scr)
+        scr = scr[scr["dividend_yield"] >= min_div_yield].copy()
+        if scr.empty:
+            print(
+                f"  No names with dividend yield ≥ {min_div_yield:g}% "
+                f"(had {before} in pool). Lower the filter."
+            )
+            sys.exit(1)
+        print(f"  Dividend filter ≥ {min_div_yield:g}%: {len(scr)} names remain.")
+
+    scr["score"] = (
+        w_blue * _rank_score(scr["blue_chip_score"])
+        + w_div * _rank_score(scr["dividend_yield"])
+        + w_growth * _rank_score(scr["change_1y_pct"])
+    )
+    scr = scr.sort_values("score", ascending=False)
+
+    picked: list[pd.Series] = []
+    sector_counts: dict[str, int] = {}
+    for _, row in scr.iterrows():
+        sec = str(row["sector_name"])
+        if sector_counts.get(sec, 0) >= max_per_sector:
+            continue
+        sector_counts[sec] = sector_counts.get(sec, 0) + 1
+        picked.append(row)
+        if len(picked) >= target_count:
+            break
+
+    if not picked:
+        print("  Could not pick any stocks (check filters).")
+        sys.exit(1)
+
+    sel = pd.DataFrame(picked)
+    price_ok: list[dict] = []
+    for _, row in sel.iterrows():
+        sym = str(row["symbol"]).upper()
+        price = row.get("price")
+        if price is None or (isinstance(price, float) and math.isnan(price)):
+            price = _fallback_price_from_history(sym)
+        if price is None:
+            continue
+        price_ok.append(
+            {
+                "symbol": sym,
+                "name": str(row.get("name", sym)),
+                "sector_name": str(row.get("sector_name", "UNKNOWN")),
+                "price": float(price),
+                "idx_weight": float(row["score"]),
+                "dividend_yield": float(row.get("dividend_yield", 0.0)),
+                "change_1y_pct": float(row.get("change_1y_pct", 0.0)),
+                "blue_chip_score": float(row.get("blue_chip_score", 0.0)),
+            }
+        )
+
+    if not price_ok:
+        print("  Could not price any selected names.")
+        sys.exit(1)
+
+    df = pd.DataFrame(price_ok)
+    total = df["idx_weight"].sum()
+    if total <= 0:
+        df["idx_weight"] = 1.0
+    else:
+        df["idx_weight"] = df["idx_weight"] / total * 100.0
+    return df.sort_values("idx_weight", ascending=False).reset_index(drop=True)
+
+
+def run_custom_basket_flow() -> None:
+    print(
+        "\nCustom basket SIP — blend blue-chip index/ETF names with "
+        "dividend yield and 1-year momentum (PSX screener).\n"
+        "  Mid-term / swing-friendly: you choose the mix, not a single index or ETF.\n"
+        "  Not investment advice — review names before you buy."
+    )
+    index_names, etf_symbols = choose_custom_basket_pool()
+    w_blue, w_div, w_growth = choose_custom_basket_blend()
+    target_count = int(
+        prompt_positive_float(
+            f"\nHow many stocks in the basket (typical {CUSTOM_BASKET_DEFAULT_COUNT})",
+            float(CUSTOM_BASKET_DEFAULT_COUNT),
+        )
+    )
+    target_count = max(3, min(40, target_count))
+    min_div = prompt_non_negative_float(
+        "Minimum dividend yield % (0 = no filter)", 0.0
+    )
+    basket_id = prompt("Basket label for files [smart_basket]: ").strip() or "smart_basket"
+    basket_id = re.sub(r"[^\w\-]+", "_", basket_id)[:40]
+
+    df = build_smart_custom_basket(
+        index_names,
+        etf_symbols,
+        w_blue=w_blue,
+        w_div=w_div,
+        w_growth=w_growth,
+        target_count=target_count,
+        min_div_yield=min_div,
+        max_per_sector=CUSTOM_BASKET_MAX_PER_SECTOR,
+    )
+
+    print(f"\n{'=' * 72}")
+    print(f"  Proposed custom basket ({len(df)} names)")
+    print(
+        f"  Blend: {w_blue*100:.0f}% blue chip / {w_div*100:.0f}% dividend / "
+        f"{w_growth*100:.0f}% 1y"
+    )
+    print(f"{'=' * 72}\n")
+    show = df[
+        [
+            "symbol",
+            "name",
+            "sector_name",
+            "price",
+            "idx_weight",
+            "dividend_yield",
+            "change_1y_pct",
+        ]
+    ].copy()
+    show["price"] = show["price"].map(lambda p: f"{p:,.2f}")
+    show["idx_weight"] = show["idx_weight"].map(lambda w: f"{w:.2f}%")
+    show["dividend_yield"] = show["dividend_yield"].map(lambda v: f"{v:.2f}%")
+    show["change_1y_pct"] = show["change_1y_pct"].map(lambda v: f"{v:+.1f}%")
+    show = show.rename(columns={"idx_weight": "target_weight", "change_1y_pct": "1y_chg"})
+    print(show.to_string(index=False))
+
+    confirm = prompt("\nUse this basket for SIP planning? [Y/n]: ").lower()
+    if confirm in ("n", "no"):
+        print("  Cancelled.")
+        return
+
+    meta = {
+        "index_name": basket_id,
+        "as_of": _utc_now_iso(),
+        "title": f"Custom basket {basket_id}",
+        "parsed_holdings": [],
+        "missing_price_symbols": [],
+        "custom_blend": f"{w_blue:.2f},{w_div:.2f},{w_growth:.2f}",
+    }
+    _run_benchmark_sip_flow(
+        df,
+        meta,
+        source_type="custom",
+        source_id=basket_id,
+        universe_label="custom basket",
+        weight_label="target",
+        empty_exclusion_msg="All names were excluded. Nothing to allocate.",
+        exclusion_unit="names",
+    )
+
+
 def sector_weight_table(df: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict] = []
     for sector, grp in df.groupby("sector_name"):
@@ -1775,6 +2120,76 @@ def compute_sip_plan(
         plan["actual_weight_pct"] = 0.0
     plan["leftover_pkr"] = plan["target_pkr"] - plan["invested_pkr"]
     return plan.sort_values("weight_pct", ascending=False).reset_index(drop=True)
+
+
+def _finalize_plan_metrics(plan: pd.DataFrame, investment_pkr: float) -> pd.DataFrame:
+    plan["invested_pkr"] = plan["shares"] * plan["effective_price"]
+    total_invested = plan["invested_pkr"].sum()
+    if total_invested > 0:
+        plan["actual_weight_pct"] = plan["invested_pkr"] / total_invested * 100.0
+    else:
+        plan["actual_weight_pct"] = 0.0
+    if "target_pkr" in plan.columns:
+        plan["leftover_pkr"] = plan["target_pkr"] - plan["invested_pkr"]
+    return plan.sort_values("weight_pct", ascending=False).reset_index(drop=True)
+
+
+def compute_equal_held_topup_plan(
+    df: pd.DataFrame,
+    investment_pkr: float,
+    use_board_lot: bool,
+    cost_buffer_pct: float,
+) -> pd.DataFrame:
+    if df.empty:
+        return df
+    plan = df.copy()
+    plan["effective_price"] = plan["price"] * (1.0 + cost_buffer_pct / 100.0)
+    n = len(plan)
+    plan["weight_pct"] = 100.0 / n
+    plan["target_pkr"] = investment_pkr / n
+    plan["shares"] = _initial_share_counts(
+        plan["target_pkr"], plan["effective_price"], use_board_lot
+    )
+    plan = _redeploy_cash_to_weights(plan, investment_pkr, use_board_lot)
+    return _finalize_plan_metrics(plan, investment_pkr)
+
+
+def compute_benchmark_gap_topup_plan(
+    live_df: pd.DataFrame,
+    prior_shares: dict[str, int],
+    investment_pkr: float,
+    use_board_lot: bool,
+    cost_buffer_pct: float,
+) -> pd.DataFrame:
+    if live_df.empty:
+        return live_df
+    live = live_df.copy()
+    live["symbol"] = live["symbol"].astype(str).str.upper()
+    total_w = float(live["idx_weight"].sum())
+    if total_w <= 0:
+        print("Benchmark weights are zero; cannot top-up.")
+        sys.exit(1)
+
+    live["effective_price"] = live["price"] * (1.0 + cost_buffer_pct / 100.0)
+    shares_held = live["symbol"].map(lambda s: int(prior_shares.get(s, 0)))
+    live["current_value"] = shares_held * live["price"]
+    current_value = float(live["current_value"].sum())
+    post_total = current_value + investment_pkr
+
+    live["weight_pct"] = live["idx_weight"] / total_w * 100.0
+    live["target_value"] = post_total * (live["idx_weight"] / total_w)
+    live["gap_pkr"] = (live["target_value"] - live["current_value"]).clip(lower=0.0)
+    gap_sum = float(live["gap_pkr"].sum())
+    if gap_sum > 1e-6:
+        live["target_pkr"] = investment_pkr * (live["gap_pkr"] / gap_sum)
+    else:
+        live["target_pkr"] = investment_pkr * (live["idx_weight"] / total_w)
+
+    live["shares"] = _initial_share_counts(
+        live["target_pkr"], live["effective_price"], use_board_lot
+    )
+    live = _redeploy_cash_to_weights(live, investment_pkr, use_board_lot)
+    return _finalize_plan_metrics(live, investment_pkr)
 
 
 def print_plan(
@@ -2422,7 +2837,7 @@ def run_holdings_align_flow() -> None:
     print(
         "\nLoad holdings to compare (holdings snapshot CSV, plan CSV, or manual)."
     )
-    prior = choose_topup_holdings_source(
+    prior, snap_header, snap_df = choose_topup_holdings_source(
         f"psx_sip_holdings_{source_id.lower()}.csv",
         source_type,
         source_id,
@@ -2433,9 +2848,18 @@ def run_holdings_align_flow() -> None:
     if ans not in ("y", "yes"):
         return
 
-    scoped = _scoped_frame_for_topup(prior, live_df)
+    topup_strategy = choose_topup_strategy()
+    scoped, prior = run_topup_from_prior_shares(
+        prior,
+        live_df,
+        source_type,
+        source_id,
+        topup_strategy=topup_strategy,
+        snapshot_df=snap_df,
+        snapshot_header=snap_header,
+    )
     if scoped.empty:
-        print("  No held symbols in live basket; cannot top-up.")
+        print("  No symbols to allocate; cannot top-up.")
         return
     investment_pkr = prompt_positive_float(
         "\nMonthly SIP investment amount (PKR)"
@@ -2449,7 +2873,126 @@ def run_holdings_align_flow() -> None:
         live_df=live_df,
         meta=meta,
         prior_shares=prior,
+        topup_strategy=topup_strategy,
     )
+
+
+def report_basket_drift(
+    snapshot_df: pd.DataFrame,
+    live_df: pd.DataFrame,
+    header: dict[str, str] | None,
+) -> None:
+    """Compare saved snapshot basket lines to live index/ETF/custom weights."""
+    if snapshot_df.empty or live_df.empty:
+        return
+    snap = snapshot_df.copy()
+    snap["symbol"] = snap["symbol"].astype(str).str.upper()
+    if "idx_weight_pct" in snap.columns:
+        snap["saved_weight"] = pd.to_numeric(
+            snap["idx_weight_pct"], errors="coerce"
+        )
+    else:
+        snap["saved_weight"] = pd.nan
+
+    live = live_df.copy()
+    live["symbol"] = live["symbol"].astype(str).str.upper()
+    live_w = live.set_index("symbol")["idx_weight"]
+    live_total = float(live_w.sum()) or 1.0
+    live_pct = live_w / live_total * 100.0
+
+    basket_rows = snap
+    if "data_status" in snap.columns:
+        st = snap["data_status"]
+        basket_rows = snap[
+            st.isna() | st.astype(str).str.lower().isin(("ok", "", "nan"))
+        ]
+
+    saved_syms = set(basket_rows["symbol"].astype(str))
+    live_syms = set(live["symbol"].astype(str))
+    added = sorted(live_syms - saved_syms)
+    dropped = sorted(saved_syms - live_syms)
+
+    print(f"\n--- Basket change vs your last snapshot ---")
+    if header:
+        gen = header.get("generated_at", "")
+        if gen:
+            print(f"  Snapshot from: {gen}")
+        as_of = header.get("basket_as_of", "")
+        if as_of:
+            print(f"  Saved basket_as_of: {as_of}")
+
+    if added:
+        show = live[live["symbol"].isin(added)].sort_values("idx_weight", ascending=False)
+        print(f"\n  New in live benchmark ({len(added)}):")
+        for _, row in show.head(12).iterrows():
+            w = float(row["idx_weight"]) / live_total * 100.0
+            print(f"    {row['symbol']}: {w:.2f}%")
+        if len(added) > 12:
+            print(f"    … and {len(added) - 12} more")
+
+    if dropped:
+        print(f"\n  No longer in live benchmark ({len(dropped)}):")
+        for sym in dropped[:12]:
+            sw = basket_rows.loc[basket_rows["symbol"] == sym, "saved_weight"]
+            txt = f" (was {float(sw.iloc[0]):.2f}%)" if len(sw) else ""
+            print(f"    {sym}{txt}")
+        if len(dropped) > 12:
+            print(f"    … and {len(dropped) - 12} more")
+
+    drift_rows: list[dict] = []
+    for sym in sorted(saved_syms & live_syms):
+        saved = basket_rows.loc[basket_rows["symbol"] == sym, "saved_weight"]
+        if saved.empty or pd.isna(saved.iloc[0]):
+            continue
+        old_w = float(saved.iloc[0])
+        new_w = float(live_pct.get(sym, 0.0))
+        delta = new_w - old_w
+        if abs(delta) >= BASKET_WEIGHT_DRIFT_PP:
+            drift_rows.append(
+                {
+                    "symbol": sym,
+                    "saved_pct": old_w,
+                    "live_pct": new_w,
+                    "change_pp": delta,
+                }
+            )
+
+    if drift_rows:
+        drift_rows.sort(key=lambda r: abs(r["change_pp"]), reverse=True)
+        print(
+            f"\n  Weight shifts ≥ {BASKET_WEIGHT_DRIFT_PP:g} pp "
+            f"since snapshot ({len(drift_rows)} names):"
+        )
+        df = pd.DataFrame(drift_rows[:10])
+        df["saved_pct"] = df["saved_pct"].map(lambda v: f"{v:.2f}%")
+        df["live_pct"] = df["live_pct"].map(lambda v: f"{v:.2f}%")
+        df["change_pp"] = df["change_pp"].map(lambda v: f"{v:+.2f}")
+        print(df.to_string(index=False))
+    elif not added and not dropped:
+        print("  No material basket membership or weight drift detected.")
+
+
+def choose_topup_strategy() -> str:
+    print("\nHow should this top-up allocate new cash?\n")
+    print(
+        "  1. Held names only — live weights among symbols you already own "
+        "(default)"
+    )
+    print("  2. Equal split — same PKR budget to each held name")
+    print(
+        "  3. Benchmark gap-fill — move toward full benchmark weights "
+        "(may buy names you do not hold yet)"
+    )
+    print()
+    while True:
+        choice = prompt("Select [1]: ") or "1"
+        if choice in ("1", "held", "weights", "default"):
+            return "held_weights"
+        if choice in ("2", "equal", "split"):
+            return "equal_held"
+        if choice in ("3", "benchmark", "gap", "rebalance", "full"):
+            return "benchmark_gap"
+        print("  Enter 1, 2, or 3.")
 
 
 def print_switch_considerations(
@@ -2631,7 +3174,7 @@ def _load_prior_shares_from_any_csv(
     path: str,
     source_type: str,
     source_id: str,
-) -> dict[str, int]:
+) -> tuple[dict[str, int], dict[str, str] | None, pd.DataFrame | None]:
     kind = os.environ.get("PSX_SIP_HOLDINGS_KIND", "auto").strip().lower()
     use_snapshot = kind in ("snapshot", "holdings", "h")
     use_plan = kind in ("plan", "p")
@@ -2645,9 +3188,9 @@ def _load_prior_shares_from_any_csv(
         if not prior:
             print("  No shares_held > 0 in the holdings file.")
             sys.exit(1)
-        return prior
+        return prior, header, snap
     if use_plan:
-        return load_prior_shares_from_plan_csv(path)
+        return load_prior_shares_from_plan_csv(path), None, None
     print(f"  Unknown PSX_SIP_HOLDINGS_KIND={kind!r} (use auto, snapshot, or plan).")
     sys.exit(1)
 
@@ -2691,7 +3234,7 @@ def choose_topup_holdings_source(
     default_snapshot: str,
     source_type: str,
     source_id: str,
-) -> dict[str, int]:
+) -> tuple[dict[str, int], dict[str, str] | None, pd.DataFrame | None]:
     env_path = _env_holdings_csv_path()
     if env_path:
         print(f"\nUsing PSX_SIP_HOLDINGS: {env_path}")
@@ -2736,7 +3279,7 @@ def choose_topup_holdings_source(
             return _load_prior_shares_from_any_csv(path, source_type, source_id)
 
         if pick == manual_idx:
-            return prompt_manual_holdings()
+            return prompt_manual_holdings(), None, None
 
         print(f"  Enter 1–{manual_idx} or h.")
 
@@ -2769,13 +3312,29 @@ def run_topup_from_prior_shares(
     live_df: pd.DataFrame,
     source_type: str,
     source_id: str,
+    *,
+    topup_strategy: str = "held_weights",
+    snapshot_df: pd.DataFrame | None = None,
+    snapshot_header: dict[str, str] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
     held_symbols = {s for s, q in prior_shares.items() if q > 0}
     if not held_symbols:
         print("  No holdings with share count > 0.")
         sys.exit(1)
 
-    subset = live_df[live_df["symbol"].isin(held_symbols)].copy()
+    if snapshot_df is not None:
+        report_basket_drift(snapshot_df, live_df, snapshot_header)
+
+    if topup_strategy == "benchmark_gap":
+        print(
+            f"\nTop-up: benchmark gap-fill on full {source_type} {source_id} "
+            f"({len(live_df)} names)."
+        )
+        print_switch_considerations(held_symbols, live_df)
+        return live_df.reset_index(drop=True), prior_shares
+
+    live_syms = live_df["symbol"].astype(str).str.upper()
+    subset = live_df[live_syms.isin(held_symbols)].copy()
     missing_live = held_symbols - set(subset["symbol"].astype(str))
     if missing_live:
         print(
@@ -2793,9 +3352,14 @@ def run_topup_from_prior_shares(
                 "not in live priced basket."
             )
 
+    mode_label = (
+        "equal PKR per held name"
+        if topup_strategy == "equal_held"
+        else "live weights among held names only"
+    )
     print(
-        f"\nTop-up mode: {len(subset)} held name(s), "
-        f"weights re-normalized from live {source_type} {source_id}."
+        f"\nTop-up mode: {len(subset)} held name(s) — {mode_label} "
+        f"({source_type} {source_id})."
     )
     show = subset[["symbol", "name", "idx_weight"]].copy()
     show["idx_weight"] = show["idx_weight"].map(lambda w: f"{w:.2f}%")
@@ -2809,11 +3373,21 @@ def run_topup_flow(
     source_type: str,
     source_id: str,
     default_snapshot: str,
-) -> tuple[pd.DataFrame, dict[str, int]]:
-    prior = choose_topup_holdings_source(
+) -> tuple[pd.DataFrame, dict[str, int], str]:
+    prior, snap_header, snap_df = choose_topup_holdings_source(
         default_snapshot, source_type, source_id
     )
-    return run_topup_from_prior_shares(prior, live_df, source_type, source_id)
+    topup_strategy = choose_topup_strategy()
+    scoped, prior = run_topup_from_prior_shares(
+        prior,
+        live_df,
+        source_type,
+        source_id,
+        topup_strategy=topup_strategy,
+        snapshot_df=snap_df,
+        snapshot_header=snap_header,
+    )
+    return scoped, prior, topup_strategy
 
 
 def maybe_save_csv(plan: pd.DataFrame, default_name: str = "psx_sip_plan.csv") -> None:
@@ -2835,6 +3409,7 @@ def _finalize_sip_plan(
     live_df: pd.DataFrame | None = None,
     meta: dict | None = None,
     prior_shares: dict[str, int] | None = None,
+    topup_strategy: str = "held_weights",
 ) -> None:
     cost_buffer_pct = prompt_non_negative_float(
         "Extra cost buffer on buy price (%)",
@@ -2846,10 +3421,31 @@ def _finalize_sip_plan(
     ).lower()
     use_board_lot = lot_answer in ("y", "yes")
 
-    plan = compute_sip_plan(scoped, investment_pkr, use_board_lot, cost_buffer_pct)
+    basket_df = live_df if live_df is not None else scoped
+    if (
+        prior_shares
+        and topup_strategy == "benchmark_gap"
+        and live_df is not None
+    ):
+        plan = compute_benchmark_gap_topup_plan(
+            live_df,
+            prior_shares,
+            investment_pkr,
+            use_board_lot,
+            cost_buffer_pct,
+        )
+        print(
+            "\n  Top-up math: sized vs full benchmark after adding this deposit "
+            "(may include new names)."
+        )
+    elif prior_shares and topup_strategy == "equal_held":
+        plan = compute_equal_held_topup_plan(
+            scoped, investment_pkr, use_board_lot, cost_buffer_pct
+        )
+    else:
+        plan = compute_sip_plan(scoped, investment_pkr, use_board_lot, cost_buffer_pct)
     print_plan(plan, investment_pkr, use_board_lot, cost_buffer_pct)
     maybe_save_csv(plan, default_name=default_csv)
-    basket_df = live_df if live_df is not None else scoped
     holdings_default = (
         f"psx_sip_holdings_{source_id.lower()}.csv"
         if source_id
@@ -2883,10 +3479,11 @@ def _run_benchmark_sip_flow(
     """Shared Index / ETF SIP path (new plan, top-up, scope, snapshot)."""
     mode = choose_sip_mode(source_id)
     prior_shares: dict[str, int] | None = None
+    topup_strategy = "held_weights"
     scoped: pd.DataFrame
     if mode == "topup":
         default_path = f"psx_sip_holdings_{source_id.lower()}.csv"
-        scoped, prior_shares = run_topup_flow(
+        scoped, prior_shares, topup_strategy = run_topup_flow(
             df, source_type, source_id, default_path
         )
     else:
@@ -2922,6 +3519,7 @@ def _run_benchmark_sip_flow(
         live_df=df,
         meta=meta,
         prior_shares=prior_shares,
+        topup_strategy=topup_strategy,
     )
 
 
@@ -2958,7 +3556,7 @@ def run_etf_flow() -> None:
 
 
 def main() -> None:
-    print(f"PSX Index / ETF SIP Planner v{__version__} (psxdata)")
+    print(f"PSX SIP Planner v{__version__} (index, ETF, custom basket — psxdata)")
     print(f"Author: {__author__} · {__date__}")
     print("=" * 40)
     print_startup_reminders()
@@ -2971,6 +3569,8 @@ def main() -> None:
             run_insights_flow()
         elif product == "align":
             run_holdings_align_flow()
+        elif product == "custom":
+            run_custom_basket_flow()
         else:
             run_index_flow()
 
