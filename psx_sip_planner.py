@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Interactive PSX index / ETF SIP planner and market insights using psxdata.
 
-Author: Salim Ali Khan · Version 1.2.0 · October 2026
+Author: Salim Ali Khan · Version 1.2.1 · October 2026
 
 Privacy: this script does not upload your holdings or plans. It only reads/writes
 files you choose locally and fetches public PSX market data (see README).
@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -1277,9 +1277,12 @@ def prompt(text: str) -> str:
         sys.exit(0)
 
 
-def prompt_positive_float(label: str) -> float:
+def prompt_positive_float(label: str, default: float | None = None) -> float:
+    hint = f" [{default:g}]" if default is not None else ""
     while True:
-        raw = prompt(f"{label}: ")
+        raw = prompt(f"{label}{hint}: ")
+        if not raw.strip() and default is not None:
+            return float(default)
         try:
             value = float(raw.replace(",", ""))
         except ValueError:
