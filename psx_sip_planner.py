@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.2.8"
+__version__ = "1.2.9"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -928,9 +928,7 @@ def print_usage_tips() -> None:
         """
 Quick reference (type h or ? at any menu):
   • Index & ETF (menus 1 & 2): new plan, top-up, scope, exclusions, snapshots.
-  • Custom basket (menu 5): standard blend or dividend-income aim (PSXDIV20 tips).
-  • Dividend (menu 6): 1=SIP from MF+PSXDIV20 weights, 2=PSXDIV20 only, 3=yield scan, 4=view only.
-  • Stock scanner (menu 7): filter screener (P/E, yield, …) + optional EPS / profit from PSX.
+  • Stock scanner (menu 5): filter screener (P/E, yield, …) + optional EPS / profit from PSX.
   • Top-up: mode 2 → then 1 held weights / 2 equal split / 3 benchmark gap-fill.
   • Snapshot load shows basket drift (new/dropped names, weight shifts).
   • Match check (menu 4): Index or ETF → CSV or SYMBOL:qty → resemblance %.
@@ -984,13 +982,7 @@ def choose_product_type() -> str:
         "(CSV or shares — how close am I?)"
     )
     print(
-        "  5. Custom basket SIP (blue-chip + dividend + growth blend)"
-    )
-    print(
-        "  6. Dividend (holdings lookup or stock SIP)"
-    )
-    print(
-        "  7. Stock scanner (P/E, dividend yield, EPS — research filter)"
+        "  5. Stock scanner (P/E, dividend yield, EPS — research filter)"
     )
     print("  h. Help (shortcuts)")
     print()
@@ -1007,13 +999,12 @@ def choose_product_type() -> str:
             return "insights"
         if choice in ("4", "compare", "match", "align", "holdings"):
             return "align"
-        if choice in ("5", "custom", "basket", "smart", "blend"):
-            return "custom"
-        if choice in ("6", "dividend", "div", "income", "yield"):
-            return "dividend_portfolio"
-        if choice in ("7", "scan", "scanner", "screener", "screen"):
+        if choice in ("5", "7", "scan", "scanner", "screener", "screen"):
             return "scanner"
-        print("  Enter 1–7, or h.")
+        if choice in ("custom", "basket", "smart", "blend", "dividend", "div", "income", "yield", "6"):
+            print("  Custom basket and dividend menus were removed (v1.2.9). Try 1–5.")
+            continue
+        print("  Enter 1–5, or h.")
 
 
 def prompt_return_to_menu() -> bool:
@@ -4812,7 +4803,7 @@ def run_etf_flow() -> None:
 
 
 def main() -> None:
-    print(f"PSX SIP Planner v{__version__} (index, ETF, custom basket — psxdata)")
+    print(f"PSX SIP Planner v{__version__} (index, ETF, scanner — psxdata)")
     print(f"Author: {__author__} · {__date__}")
     print("=" * 40)
     print_startup_reminders()
@@ -4825,10 +4816,6 @@ def main() -> None:
             run_insights_flow()
         elif product == "align":
             run_holdings_align_flow()
-        elif product == "custom":
-            run_custom_basket_flow()
-        elif product == "dividend_portfolio":
-            run_dividend_portfolio_flow()
         elif product == "scanner":
             run_stock_scanner_flow()
         else:
