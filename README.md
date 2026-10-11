@@ -6,11 +6,11 @@ Interactive **Pakistan Stock Exchange (PSX)** tool:
 2. **ETF SIP** — same for an ETF’s published creation-unit basket (with sector preview and ETF unit price).
 3. **Insights** — full snapshot, **multiple indices and/or ETFs** (not all), custom mix, or sectors only; optional CSV export.
 4. **Compare holdings** — resemblance vs an index or ETF.
-5. **Custom basket SIP** — pick a blue-chip pool (KSE100/KSE30 ± ETF names), blend **index weight + dividend yield + 1y momentum**, then run the same SIP / top-up / snapshot flow as index & ETF.
+5. **Stock scanner** — filter the PSX screener (P/E, dividend yield, etc.) and optionally enrich with EPS from company pages; export CSV or build a small SIP basket.
 
 Data comes from [psxdata](https://pypi.org/project/psxdata/) (PSX Data Portal). Cache lives under `~/.psxdata/cache/` by default.
 
-**Author:** Salim Ali Khan · **Version:** 1.2.0 · **Date:** October 2026
+**Author:** Salim Ali Khan · **Version:** 1.2.9 · **Date:** October 2026
 
 ## Requirements
 
