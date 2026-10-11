@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.2.6"
+__version__ = "1.2.7"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -929,7 +929,7 @@ def print_usage_tips() -> None:
 Quick reference (type h or ? at any menu):
   • Index & ETF (menus 1 & 2): new plan, top-up, scope, exclusions, snapshots.
   • Custom basket (menu 5): standard blend or dividend-income aim (PSXDIV20 tips).
-  • Dividend (menu 6): 1=see fund/PSXDIV20 holdings, 2–3=SIP plans (type h for income tips).
+  • Dividend (menu 6): 1=SIP from MF+PSXDIV20 weights, 2=PSXDIV20 only, 3=yield scan, 4=view only.
   • Stock scanner (menu 7): filter screener (P/E, yield, …) + optional EPS / profit from PSX.
   • Top-up: mode 2 → then 1 held weights / 2 equal split / 3 benchmark gap-fill.
   • Snapshot load shows basket drift (new/dropped names, weight shifts).
@@ -2254,6 +2254,232 @@ def _print_mutual_fund_composition(fund: dict, *, enrich_screener: bool) -> set[
     return symbols
 
 
+def _mf_equity_weight_map(fund: dict) -> dict[str, float]:
+    """FMR top-10 weights renormalized to 100% (for a DIY stock basket)."""
+    weights: dict[str, float] = {}
+    for h in fund.get("holdings") or []:
+        sym = str(h.get("symbol", "")).upper()
+        if not sym:
+            continue
+        weights[sym] = float(h.get("weight_pct", 0.0) or 0.0)
+    total = sum(weights.values())
+    if total <= 0:
+        return weights
+    return {s: w / total * 100.0 for s, w in weights.items()}
+
+
+def _psxdiv20_weight_map() -> dict[str, float]:
+    raw = fetch_indices("PSXDIV20")
+    if raw is None or raw.empty:
+        return {}
+    out: dict[str, float] = {}
+    for _, row in raw.iterrows():
+        sym = str(row["symbol"]).upper()
+        w = float(pd.to_numeric(row.get("idx_weight"), errors="coerce") or 0.0)
+        out[sym] = max(out.get(sym, 0.0), w)
+    total = sum(out.values())
+    if total <= 0:
+        return out
+    return {s: w / total * 100.0 for s, w in out.items()}
+
+
+def _renormalize_weights(weights: dict[str, float]) -> dict[str, float]:
+    total = sum(weights.values())
+    if total <= 0:
+        return weights
+    return {s: w / total * 100.0 for s, w in weights.items()}
+
+
+def _blend_weight_maps(
+    mf: dict[str, float],
+    div20: dict[str, float],
+    mode: str,
+) -> dict[str, float]:
+    if mode == "mf":
+        return _renormalize_weights(mf)
+    if mode == "div20":
+        return _renormalize_weights(div20)
+    if mode == "overlap":
+        keys = set(mf.keys()) & set(div20.keys())
+        if not keys:
+            return {}
+        blended = {k: (mf[k] + div20[k]) / 2.0 for k in keys}
+        return _renormalize_weights(blended)
+    # union — sum weights from each source (missing side = 0)
+    keys = set(mf.keys()) | set(div20.keys())
+    blended = {k: mf.get(k, 0.0) + div20.get(k, 0.0) for k in keys}
+    return _renormalize_weights(blended)
+
+
+def _dataframe_from_weight_map(
+    weights: dict[str, float], *, title: str
+) -> pd.DataFrame:
+    if not weights:
+        print("  No symbols in basket.")
+        sys.exit(1)
+    sym_meta = fetch_symbols()
+    names: dict[str, str] = {}
+    sectors: dict[str, str] = {}
+    if "symbol" in sym_meta.columns:
+        for _, row in sym_meta.iterrows():
+            s = str(row["symbol"]).upper()
+            names[s] = str(row.get("name", s))
+            sectors[s] = str(row.get("sector_name", "") or "UNKNOWN")
+
+    scr, price_col = _screener_price_frame()
+    rows: list[dict] = []
+    for sym, wt in sorted(weights.items(), key=lambda kv: kv[1], reverse=True):
+        price, _src = _resolve_live_price(sym, scr, price_col)
+        if price is None:
+            print(f"  Skipping {sym} — no price.")
+            continue
+        rows.append(
+            {
+                "symbol": sym,
+                "name": names.get(sym, sym),
+                "sector_name": sectors.get(sym, "UNKNOWN"),
+                "price": float(price),
+                "idx_weight": float(wt),
+            }
+        )
+    if not rows:
+        print("  Could not price any names in basket.")
+        sys.exit(1)
+    df = pd.DataFrame(rows)
+    df["idx_weight"] = df["idx_weight"] / df["idx_weight"].sum() * 100.0
+    return df.sort_values("idx_weight", ascending=False).reset_index(drop=True)
+
+
+def _choose_dividend_mutual_fund(funds: list[dict]) -> dict:
+    mdyp = [f for f in funds if "MDYP" in str(f.get("name", ""))]
+    default = mdyp[0] if mdyp else funds[0]
+    if len(funds) == 1:
+        return funds[0]
+    print("\n  Mutual fund reference (FMR top-10 snapshot):")
+    for i, f in enumerate(funds, start=1):
+        label = str(f.get("id") or f.get("name", ""))[:55]
+        mark = " [default]" if f is default else ""
+        print(f"    {i}. {label}{mark}")
+    while True:
+        raw = prompt("Fund [1]: ").strip() or "1"
+        try:
+            idx = int(raw) - 1
+        except ValueError:
+            if raw.lower() in ("mdyp", "meezan") and mdyp:
+                return mdyp[0]
+            print("  Enter a number from the list.")
+            continue
+        if 0 <= idx < len(funds):
+            return funds[idx]
+        print("  Out of range.")
+
+
+def run_dividend_mf_psxdiv20_sip_flow() -> None:
+    """Show MF + PSXDIV20, then set target stock weights and continue to SIP."""
+    funds = _load_dividend_fund_compositions()
+    if not funds:
+        print(
+            "\n  Mutual fund snapshots missing (need dividend_funds_data.py). "
+            "Using PSXDIV20 only."
+        )
+        df, meta = load_index_frame("PSXDIV20")
+        print_overview_tables(df, "PSXDIV20")
+        _run_benchmark_sip_flow(
+            df,
+            meta,
+            source_type="index",
+            source_id="PSXDIV20",
+            universe_label="PSXDIV20",
+            weight_label="index",
+            empty_exclusion_msg="All constituents were excluded.",
+            exclusion_unit="constituents",
+        )
+        return
+
+    fund = _choose_dividend_mutual_fund(funds)
+    mf_label = str(fund.get("id") or "MF")[:40]
+    print("\n  Reference lists (for your target weights — not fund performance):\n")
+    _print_mutual_fund_composition(fund, enrich_screener=False)
+    _print_psxdiv20_composition_table(enrich_screener=False)
+
+    print(
+        "\n  How should your stock SIP target weights be set?\n"
+        "    a. Mutual fund top-10 (renormalized to 100%)\n"
+        "    b. PSXDIV20 index (live weights)\n"
+        "    c. Stocks in BOTH lists — average of (a) and (b)\n"
+        "    d. All stocks from fund + PSXDIV20 — sum weights, then renormalize"
+    )
+    pick = prompt("Weights [c]: ").lower() or "c"
+    mode_map = {
+        "a": "mf",
+        "mf": "mf",
+        "fund": "mf",
+        "1": "mf",
+        "b": "div20",
+        "div20": "div20",
+        "index": "div20",
+        "2": "div20",
+        "c": "overlap",
+        "both": "overlap",
+        "overlap": "overlap",
+        "3": "overlap",
+        "d": "union",
+        "union": "union",
+        "all": "union",
+        "4": "union",
+    }
+    blend_mode = mode_map.get(pick, "overlap")
+    mf_w = _mf_equity_weight_map(fund)
+    div_w = _psxdiv20_weight_map()
+    if not div_w:
+        print("  Could not load PSXDIV20; using fund weights only.")
+        blend_mode = "mf"
+    target_w = _blend_weight_maps(mf_w, div_w, blend_mode)
+    if not target_w:
+        print("  Empty basket (e.g. no overlap). Try option d or b.")
+        return
+
+    mode_labels = {
+        "mf": f"{mf_label} top-10",
+        "div20": "PSXDIV20 index",
+        "overlap": f"{mf_label} ∩ PSXDIV20 (avg weights)",
+        "union": f"{mf_label} ∪ PSXDIV20 (blended)",
+    }
+    title = mode_labels.get(blend_mode, "Dividend blend")
+    df = _dataframe_from_weight_map(target_w, title=title)
+
+    print(f"\n--- Your target basket: {title} ({len(df)} stocks) ---")
+    show = df[["symbol", "name", "idx_weight"]].copy()
+    show["idx_weight"] = show["idx_weight"].map(lambda w: f"{w:.2f}%")
+    show = show.rename(columns={"idx_weight": "target_weight"})
+    print(show.to_string(index=False))
+
+    confirm = prompt("\nUse this basket for SIP planning? [Y/n]: ").lower()
+    if confirm in ("n", "no"):
+        print("  Cancelled.")
+        return
+
+    basket_id = re.sub(r"[^\w\-]+", "_", f"div_{blend_mode}_{mf_label}")[:36]
+    meta = {
+        "index_name": basket_id,
+        "as_of": _utc_now_iso(),
+        "title": title,
+        "parsed_holdings": [],
+        "missing_price_symbols": [],
+        "dividend_blend": blend_mode,
+    }
+    _run_benchmark_sip_flow(
+        df,
+        meta,
+        source_type="custom",
+        source_id=basket_id,
+        universe_label="dividend basket",
+        weight_label="target",
+        empty_exclusion_msg="All names were excluded. Nothing to allocate.",
+        exclusion_unit="names",
+    )
+
+
 def run_dividend_reference_composition_flow() -> None:
     """Show FMR top-10 stock lists + PSXDIV20 — no SIP, no performance."""
     funds = _load_dividend_fund_compositions()
@@ -2304,22 +2530,25 @@ def run_dividend_reference_composition_flow() -> None:
 
 
 def choose_dividend_portfolio_style() -> str:
-    print("\n  1. See holdings — mutual funds + PSXDIV20 (no SIP)")
-    print("  2. SIP — buy PSXDIV20 index weights")
-    print("  3. SIP — pick high-yield stocks (PSXDIV20 or whole market)")
+    print("\n  1. SIP — set holdings from mutual fund + PSXDIV20 (recommended)")
+    print("  2. SIP — PSXDIV20 index only")
+    print("  3. SIP — high-yield stock pick (PSXDIV20 or whole market)")
+    print("  4. View holdings only — no SIP plan")
     print("  h. Dividend income tips")
     while True:
         choice = prompt("Select [1]: ") or "1"
         if _is_help_choice(choice):
             print_dividend_income_strategy_tips()
             continue
-        if choice in ("1", "ref", "reference", "holdings", "see", "lookup"):
-            return "reference"
+        if choice in ("1", "mf", "blend", "both", "fund"):
+            return "mf_div_sip"
         if choice in ("2", "index", "psxdiv20", "div20"):
             return "index"
         if choice in ("3", "sip", "yield", "scan", "stocks"):
             return "yield_sip"
-        print("  Enter 1, 2, 3, or h.")
+        if choice in ("4", "ref", "reference", "holdings", "see", "view"):
+            return "reference"
+        print("  Enter 1–4, or h.")
 
 
 def _choose_high_yield_sip_pool() -> tuple[set[str], str, str]:
@@ -2344,6 +2573,10 @@ def _choose_high_yield_sip_pool() -> tuple[set[str], str, str]:
 def run_dividend_portfolio_flow() -> None:
     print("\nDividend menu — compare fund holdings or plan a stock SIP (not advice).")
     style = choose_dividend_portfolio_style()
+
+    if style == "mf_div_sip":
+        run_dividend_mf_psxdiv20_sip_flow()
+        return
 
     if style == "reference":
         run_dividend_reference_composition_flow()
