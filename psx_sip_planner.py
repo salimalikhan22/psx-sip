@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.2.5"
+__version__ = "1.2.6"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -929,7 +929,7 @@ def print_usage_tips() -> None:
 Quick reference (type h or ? at any menu):
   • Index & ETF (menus 1 & 2): new plan, top-up, scope, exclusions, snapshots.
   • Custom basket (menu 5): standard blend or dividend-income aim (PSXDIV20 tips).
-  • Dividend portfolio (menu 6): SIP baskets, or option 4 to view MF + PSXDIV20 holdings only.
+  • Dividend (menu 6): 1=see fund/PSXDIV20 holdings, 2–3=SIP plans (type h for income tips).
   • Stock scanner (menu 7): filter screener (P/E, yield, …) + optional EPS / profit from PSX.
   • Top-up: mode 2 → then 1 held weights / 2 equal split / 3 benchmark gap-fill.
   • Snapshot load shows basket drift (new/dropped names, weight shifts).
@@ -987,7 +987,7 @@ def choose_product_type() -> str:
         "  5. Custom basket SIP (blue-chip + dividend + growth blend)"
     )
     print(
-        "  6. Dividend portfolio (PSXDIV20 or yield-focused basket → SIP)"
+        "  6. Dividend (holdings lookup or stock SIP)"
     )
     print(
         "  7. Stock scanner (P/E, dividend yield, EPS — research filter)"
@@ -2115,22 +2115,56 @@ def build_yield_weighted_dividend_basket(
     )
 
 
+def _planner_root() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def _planner_data_dir() -> str:
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    return os.path.join(_planner_root(), "data")
+
+
+def _load_bundled_dividend_funds_module() -> list[dict]:
+    """Load dividend_funds_data.py from the same folder as this script (any cwd)."""
+    import importlib.util
+
+    mod_path = os.path.join(_planner_root(), "dividend_funds_data.py")
+    if not os.path.isfile(mod_path):
+        return []
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "psx_sip_dividend_funds_data", mod_path
+        )
+        if spec is None or spec.loader is None:
+            return []
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        funds = getattr(mod, "BUNDLED_DIVIDEND_FUNDS", None) or []
+        return [f for f in funds if isinstance(f, dict) and f.get("holdings")]
+    except Exception:
+        return []
 
 
 def _load_dividend_fund_compositions() -> list[dict]:
-    """Top-10 equity snapshots from FMR reports (bundled JSON — not live NAV/returns)."""
-    path = os.path.join(_planner_data_dir(), "dividend_fund_composition.json")
-    if not os.path.isfile(path):
-        return []
-    try:
-        with open(path, encoding="utf-8") as fh:
-            payload = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return []
-    funds = payload.get("funds") or []
-    return [f for f in funds if isinstance(f, dict) and f.get("holdings")]
+    """Top-10 equity snapshots from FMR reports (not live NAV/returns)."""
+    candidates: list[str] = []
+    env_path = os.environ.get("PSX_SIP_DIVIDEND_FUNDS_JSON", "").strip()
+    if env_path:
+        candidates.append(os.path.expanduser(env_path))
+    candidates.append(os.path.join(_planner_data_dir(), "dividend_fund_composition.json"))
+    candidates.append(os.path.expanduser("~/.psx-sip/dividend_fund_composition.json"))
+    for path in candidates:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                payload = json.load(fh)
+            funds = payload.get("funds") or []
+            out = [f for f in funds if isinstance(f, dict) and f.get("holdings")]
+            if out:
+                return out
+        except (OSError, json.JSONDecodeError):
+            continue
+    return _load_bundled_dividend_funds_module()
 
 
 def _print_psxdiv20_composition_table(*, enrich_screener: bool) -> set[str]:
@@ -2172,13 +2206,7 @@ def _print_psxdiv20_composition_table(*, enrich_screener: bool) -> set[str]:
             entry["pe"] = float(pe) if pe is not None and pd.notna(pe) else None
         rows.append(entry)
 
-    print(f"\n{'=' * 72}")
-    print("  PSX Dividend 20 index (PSXDIV20) — official index weights")
-    print(f"{'=' * 72}\n")
-    if enrich_screener:
-        print(
-            "  div_yield / P/E from live screener (for stock filtering — not fund performance).\n"
-        )
+    print(f"\n--- PSXDIV20 (live index) ---")
     for r in rows:
         line = f"  {r['symbol']:<6} {r['weight_pct']:5.2f}%  {r['name'][:42]}"
         if enrich_screener:
@@ -2200,22 +2228,13 @@ def _print_mutual_fund_composition(fund: dict, *, enrich_screener: bool) -> set[
         for _, row in scr.iterrows():
             scr_by_sym[str(row["symbol"]).upper()] = row
 
-    print(f"\n{'=' * 72}")
-    print(f"  {fund.get('name', 'Mutual fund')}")
+    short = str(fund.get("id") or fund.get("name", "Fund"))[:48]
     as_of = fund.get("report_as_of", "")
+    hdr = f"--- {short} (FMR top-10"
     if as_of:
-        print(f"  Report as of: {as_of}")
-    basis = fund.get("weight_basis", "")
-    if basis:
-        print(f"  Weight basis: {basis.replace('_', ' ')}")
-    notes = str(fund.get("notes", "") or "").strip()
-    if notes:
-        print(f"  Note: {notes[:200]}" + ("…" if len(notes) > 200 else ""))
-    print(f"{'=' * 72}\n")
-    if enrich_screener:
-        print(
-            "  div_yield / P/E from live screener (compare stocks — not fund NAV or returns).\n"
-        )
+        hdr += f", {as_of}"
+    hdr += ") ---"
+    print(f"\n{hdr}")
     for h in holdings:
         sym = str(h.get("symbol", "")).upper()
         if not sym:
@@ -2232,144 +2251,98 @@ def _print_mutual_fund_composition(fund: dict, *, enrich_screener: bool) -> set[
             pe_s = f"{pe:.1f}" if pe is not None and pd.notna(pe) else "—"
             line += f"  yield {dy:.2f}%  P/E {pe_s}"
         print(line)
-    url = str(fund.get("source_url", "") or "").strip()
-    if url:
-        print(f"\n  Source: {url}")
     return symbols
 
 
-def _print_overlap_summary(
-    label: str, base: set[str], others: list[tuple[str, set[str]]]
-) -> None:
-    if not base:
-        return
-    print(f"\n  Overlap vs {label} ({len(base)} symbols):")
-    for name, symset in others:
-        if not symset:
-            continue
-        both = base & symset
-        print(f"    • {name}: {len(both)} shared — {', '.join(sorted(both)[:20])}"
-              + (" …" if len(both) > 20 else ""))
-
-
 def run_dividend_reference_composition_flow() -> None:
-    print(
-        "\nReference compositions — what stocks dividend funds and PSXDIV20 hold.\n"
-        "  From published FMR top-10 snapshots (bundled) + live PSXDIV20 index.\n"
-        "  No NAV, returns, or performance — holdings research only."
-    )
+    """Show FMR top-10 stock lists + PSXDIV20 — no SIP, no performance."""
     funds = _load_dividend_fund_compositions()
     if not funds:
+        root = _planner_root()
         print(
-            f"\n  No bundled fund file at data/dividend_fund_composition.json "
-            f"(expected next to psx_sip_planner.py)."
+            "\n  Could not load mutual fund holdings.\n"
+            f"  Run the planner from your psx-sip folder (script at {root})\n"
+            "  and ensure dividend_funds_data.py is beside psx_sip_planner.py.\n"
+            "  Or: git pull in psx-sip, then re-run."
         )
-    enrich = prompt(
-        "Add live screener dividend yield & P/E next to each stock? [Y/n]: "
-    ).lower()
-    enrich_screener = enrich not in ("n", "no")
+        _print_psxdiv20_composition_table(enrich_screener=False)
+        return
 
-    print("\nWhat to show:\n")
-    print("  1. All — every bundled dividend fund + PSXDIV20")
-    print("  2. Pick one mutual fund")
-    print("  3. PSXDIV20 only")
-    print("  4. Meezan Dividend Yield (MDYP) only")
-    choice = prompt("Select [1]: ") or "1"
+    print(
+        "\n  Holdings only (% of fund assets, from saved FMR snapshots).\n"
+        "  Weights are not live — update data/ when new FMRs are published."
+    )
+    choice = prompt(
+        "Show [1] MDYP + PSXDIV20  [2] All funds + PSXDIV20  [3] PSXDIV20 only [1]: "
+    ) or "1"
 
-    fund_sets: list[tuple[str, set[str]]] = []
-    if choice in ("4", "mdyp", "meezan"):
-        mdyp = [f for f in funds if "MDYP" in str(f.get("name", ""))]
-        if not mdyp:
-            print("  MDYP snapshot not found in bundled data.")
-        else:
-            fund_sets.append(("MDYP FMR top-10", _print_mutual_fund_composition(
-                mdyp[0], enrich_screener=enrich_screener
-            )))
-    elif choice in ("3", "psxdiv20", "div20", "index"):
-        div20 = _print_psxdiv20_composition_table(enrich_screener=enrich_screener)
-        fund_sets.append(("PSXDIV20", div20))
-    elif choice in ("2", "fund", "mf") and funds:
-        for i, f in enumerate(funds, start=1):
-            short = str(f.get("name", ""))[:60]
-            print(f"  {i}. {short}")
-        while True:
-            raw = prompt("Fund number: ").strip()
-            try:
-                idx = int(raw) - 1
-            except ValueError:
-                print("  Enter a number from the list.")
-                continue
-            if 0 <= idx < len(funds):
-                fname = str(funds[idx].get("name", f"Fund {idx+1}"))[:40]
-                fund_sets.append((
-                    fname,
-                    _print_mutual_fund_composition(
-                        funds[idx], enrich_screener=enrich_screener
-                    ),
-                ))
-                break
-            print("  Out of range.")
+    enrich_screener = False
+    if choice not in ("3", "div20", "index"):
+        extra = prompt("Add screener yield & P/E on each line? [y/N]: ").lower()
+        enrich_screener = extra in ("y", "yes")
+
+    if choice in ("3", "div20", "index"):
+        _print_psxdiv20_composition_table(enrich_screener=enrich_screener)
+        return
+
+    if choice in ("2", "all", "a"):
+        to_show = funds
     else:
-        for f in funds:
-            fname = str(f.get("name", "Fund"))[:36]
-            fund_sets.append((
-                fname,
-                _print_mutual_fund_composition(f, enrich_screener=enrich_screener),
-            ))
-        div20 = _print_psxdiv20_composition_table(enrich_screener=enrich_screener)
-        fund_sets.append(("PSXDIV20", div20))
+        mdyp = [f for f in funds if "MDYP" in str(f.get("name", ""))]
+        to_show = mdyp if mdyp else funds[:1]
 
-    compare = prompt(
-        "\nShow symbol overlap between the tables above? [Y/n]: "
-    ).lower()
-    if compare not in ("n", "no") and len(fund_sets) >= 2:
-        anchor_name, anchor = fund_sets[0]
-        _print_overlap_summary(
-            anchor_name,
-            anchor,
-            [(n, s) for n, s in fund_sets[1:]],
+    mdyp_syms: set[str] = set()
+    for f in to_show:
+        mdyp_syms |= _print_mutual_fund_composition(f, enrich_screener=enrich_screener)
+    div20_syms = _print_psxdiv20_composition_table(enrich_screener=enrich_screener)
+    if mdyp_syms and div20_syms:
+        both = sorted(mdyp_syms & div20_syms)
+        print(
+            f"\n  Symbols in both fund list and PSXDIV20 ({len(both)}): "
+            + ", ".join(both)
         )
-        if len(fund_sets) >= 2:
-            all_syms = set().union(*(s for _, s in fund_sets))
-            print(f"\n  Union of all listed symbols: {len(all_syms)}")
 
 
 def choose_dividend_portfolio_style() -> str:
-    print("\nDividend portfolio style:\n")
-    print(
-        "  4. Reference only — mutual fund top-10 & PSXDIV20 holdings "
-        "(no SIP plan)"
-    )
-    print("  1. PSXDIV20 — official PSX Dividend 20 index weights (SIP like menu 1)")
-    print(
-        "  2. PSXDIV20 yield basket — top names by dividend yield "
-        "(weights ∝ yield, EPS filter optional)"
-    )
-    print(
-        "  3. Full market scan — highest yield across PSX screener "
-        "(min yield filter, sector cap)"
-    )
+    print("\n  1. See holdings — mutual funds + PSXDIV20 (no SIP)")
+    print("  2. SIP — buy PSXDIV20 index weights")
+    print("  3. SIP — pick high-yield stocks (PSXDIV20 or whole market)")
+    print("  h. Dividend income tips")
     while True:
         choice = prompt("Select [1]: ") or "1"
-        if choice in ("4", "ref", "reference", "mf", "funds", "composition"):
+        if _is_help_choice(choice):
+            print_dividend_income_strategy_tips()
+            continue
+        if choice in ("1", "ref", "reference", "holdings", "see", "lookup"):
             return "reference"
-        if choice in ("1", "index", "psxdiv20", "div20"):
+        if choice in ("2", "index", "psxdiv20", "div20"):
             return "index"
-        if choice in ("2", "pool", "yield20"):
-            return "div20_yield"
-        if choice in ("3", "scan", "market", "all"):
-            return "market_yield"
-        print("  Enter 1, 2, 3, or 4.")
+        if choice in ("3", "sip", "yield", "scan", "stocks"):
+            return "yield_sip"
+        print("  Enter 1, 2, 3, or h.")
+
+
+def _choose_high_yield_sip_pool() -> tuple[set[str], str, str]:
+    print("\n  Stock pool for high-yield SIP:")
+    print("  a. PSXDIV20 members only (recommended)")
+    print("  b. Whole PSX screener")
+    sub = prompt("Pool [a]: ").lower() or "a"
+    if sub in ("b", "all", "market", "scan"):
+        scr = _build_screener_enriched()
+        return (
+            set(scr["symbol"].astype(str)),
+            "Screener yield basket",
+            "dividend_screener",
+        )
+    return (
+        set(_index_constituent_weights("PSXDIV20")["symbol"].astype(str)),
+        "PSXDIV20 yield basket",
+        "dividend_psxdiv20",
+    )
 
 
 def run_dividend_portfolio_flow() -> None:
-    print(
-        "\nDividend portfolio — yield-focused stock baskets and reference holdings.\n"
-        "  Option 4 lists mutual fund top-10 stocks (FMR snapshots) and PSXDIV20.\n"
-        "  Options 1–3 build a direct PSX stock SIP plan.\n"
-        "  Not investment advice."
-    )
-    print_dividend_income_strategy_tips()
+    print("\nDividend menu — compare fund holdings or plan a stock SIP (not advice).")
     style = choose_dividend_portfolio_style()
 
     if style == "reference":
@@ -2391,27 +2364,14 @@ def run_dividend_portfolio_flow() -> None:
         )
         return
 
+    pool, label, basket_id = _choose_high_yield_sip_pool()
     target_count = int(
-        prompt_positive_float(
-            "\nHow many stocks in the dividend basket (typical 8–20)", 12.0
-        )
+        prompt_positive_float("\nHow many stocks (typical 8)", 8.0)
     )
     target_count = max(3, min(40, target_count))
     min_div = prompt_non_negative_float("Minimum dividend yield %", 4.0)
-    eps_filter = prompt(
-        "Drop names with annual EPS down 2+ years in a row? [Y/n]: "
-    ).lower()
+    eps_filter = prompt("Skip stocks with EPS down 2+ years? [Y/n]: ").lower()
     exclude_eps = eps_filter not in ("n", "no")
-
-    if style == "div20_yield":
-        pool = set(_index_constituent_weights("PSXDIV20")["symbol"].astype(str))
-        basket_id = "dividend_psxdiv20"
-        label = "PSXDIV20 yield basket"
-    else:
-        scr = _build_screener_enriched()
-        pool = set(scr["symbol"].astype(str))
-        basket_id = "dividend_screener"
-        label = "Screener yield basket"
 
     print(f"\nBuilding {label}…")
     df = build_yield_weighted_dividend_basket(
