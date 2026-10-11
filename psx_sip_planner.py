@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.2.7"
+__version__ = "1.2.8"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -2290,6 +2290,43 @@ def _renormalize_weights(weights: dict[str, float]) -> dict[str, float]:
     return {s: w / total * 100.0 for s, w in weights.items()}
 
 
+def _kmi30_symbol_set() -> set[str]:
+    """Shariah index membership proxy (PSX screener listed_in)."""
+    scr = fetch_screener()
+    if scr.empty or "listed_in" not in scr.columns:
+        return set()
+    found: set[str] = set()
+    for _, row in scr.iterrows():
+        li = str(row.get("listed_in", "")).upper()
+        if "KMI30" in li or "KMIALLSHR" in li:
+            found.add(str(row["symbol"]).upper())
+    return found
+
+
+def _apply_shariah_filter_to_div20(
+    div20: dict[str, float], *, enabled: bool
+) -> dict[str, float]:
+    if not enabled or not div20:
+        return div20
+    kmi = _kmi30_symbol_set()
+    if not kmi:
+        print("  Note: could not load KMI list — PSXDIV20 unfiltered.")
+        return div20
+    filtered = {s: w for s, w in div20.items() if s in kmi}
+    dropped = set(div20.keys()) - set(filtered.keys())
+    if dropped:
+        print(
+            f"  Shariah filter: dropped {len(dropped)} PSXDIV20 name(s) "
+            f"not on KMI30 (e.g. {', '.join(sorted(dropped)[:6])}"
+            + (" …" if len(dropped) > 6 else "")
+            + ")."
+        )
+    if not filtered:
+        print("  No PSXDIV20 names left after Shariah filter — using fund only.")
+        return {}
+    return _renormalize_weights(filtered)
+
+
 def _blend_weight_maps(
     mf: dict[str, float],
     div20: dict[str, float],
@@ -2305,10 +2342,20 @@ def _blend_weight_maps(
             return {}
         blended = {k: (mf[k] + div20[k]) / 2.0 for k in keys}
         return _renormalize_weights(blended)
+    if mode == "combined":
+        keys = set(mf.keys()) | set(div20.keys())
+        blended = {
+            k: mf.get(k, 0.0) * 0.5 + div20.get(k, 0.0) * 0.5 for k in keys
+        }
+        return _renormalize_weights(blended)
     # union — sum weights from each source (missing side = 0)
     keys = set(mf.keys()) | set(div20.keys())
     blended = {k: mf.get(k, 0.0) + div20.get(k, 0.0) for k in keys}
     return _renormalize_weights(blended)
+
+
+def _fund_is_shariah(fund: dict) -> bool:
+    return str(fund.get("shariah_scope", "")).strip().lower() == "shariah"
 
 
 def _dataframe_from_weight_map(
@@ -2350,16 +2397,31 @@ def _dataframe_from_weight_map(
     return df.sort_values("idx_weight", ascending=False).reset_index(drop=True)
 
 
+def _sorted_dividend_funds(funds: list[dict]) -> list[dict]:
+    def sort_key(f: dict) -> tuple[int, str]:
+        name = str(f.get("name", ""))
+        if "MDYP" in name:
+            return (0, name)
+        if str(f.get("shariah_scope", "")).lower() == "shariah":
+            return (1, name)
+        return (2, name)
+
+    return sorted(funds, key=sort_key)
+
+
 def _choose_dividend_mutual_fund(funds: list[dict]) -> dict:
+    funds = _sorted_dividend_funds(funds)
     mdyp = [f for f in funds if "MDYP" in str(f.get("name", ""))]
     default = mdyp[0] if mdyp else funds[0]
     if len(funds) == 1:
         return funds[0]
     print("\n  Mutual fund reference (FMR top-10 snapshot):")
     for i, f in enumerate(funds, start=1):
-        label = str(f.get("id") or f.get("name", ""))[:55]
+        label = str(f.get("id") or f.get("name", ""))[:50]
+        scope = str(f.get("shariah_scope", "") or "").strip()
+        tag = f" · {scope}" if scope else ""
         mark = " [default]" if f is default else ""
-        print(f"    {i}. {label}{mark}")
+        print(f"    {i}. {label}{tag}{mark}")
     while True:
         raw = prompt("Fund [1]: ").strip() or "1"
         try:
@@ -2398,52 +2460,73 @@ def run_dividend_mf_psxdiv20_sip_flow() -> None:
 
     fund = _choose_dividend_mutual_fund(funds)
     mf_label = str(fund.get("id") or "MF")[:40]
-    print("\n  Reference lists (for your target weights — not fund performance):\n")
+    shariah_fund = _fund_is_shariah(fund)
+    if shariah_fund:
+        print("\n  Shariah fund selected — PSXDIV20 will be filtered to KMI30 names when mixed.")
+    print("\n  Reference lists (target weights — not fund performance):\n")
     _print_mutual_fund_composition(fund, enrich_screener=False)
     _print_psxdiv20_composition_table(enrich_screener=False)
 
+    mf_w = _mf_equity_weight_map(fund)
+    overlap_n = len(set(mf_w.keys()) & set(_psxdiv20_weight_map().keys()))
     print(
-        "\n  How should your stock SIP target weights be set?\n"
-        "    a. Mutual fund top-10 (renormalized to 100%)\n"
-        "    b. PSXDIV20 index (live weights)\n"
-        "    c. Stocks in BOTH lists — average of (a) and (b)\n"
-        "    d. All stocks from fund + PSXDIV20 — sum weights, then renormalize"
+        f"\n  Fund has {len(mf_w)} stocks. Overlap with PSXDIV20: {overlap_n} "
+        f"(overlap-only modes use just those {overlap_n}, not all 10 fund names)."
     )
-    pick = prompt("Weights [c]: ").lower() or "c"
+    print(
+        "\n  Target weights for your stock SIP:\n"
+        "    1. Mutual fund top-10 only — all 10 FMR stocks (recommended)\n"
+        "    2. PSXDIV20 index only (live)\n"
+        "    3. Fund + PSXDIV20 — 50/50 blend on all symbols from both lists\n"
+        "    4. Only symbols in BOTH lists (small basket — usually not what you want)\n"
+        "    5. Fund + PSXDIV20 — sum weights from both, then renormalize"
+    )
+    pick = prompt("Weights [1]: ").strip() or "1"
     mode_map = {
+        "1": "mf",
         "a": "mf",
         "mf": "mf",
         "fund": "mf",
-        "1": "mf",
+        "2": "div20",
         "b": "div20",
         "div20": "div20",
         "index": "div20",
-        "2": "div20",
-        "c": "overlap",
-        "both": "overlap",
+        "3": "combined",
+        "combined": "combined",
+        "mix": "combined",
+        "c": "combined",
+        "4": "overlap",
         "overlap": "overlap",
-        "3": "overlap",
+        "both": "overlap",
+        "5": "union",
         "d": "union",
         "union": "union",
         "all": "union",
-        "4": "union",
     }
-    blend_mode = mode_map.get(pick, "overlap")
-    mf_w = _mf_equity_weight_map(fund)
+    blend_mode = mode_map.get(pick.lower(), "mf")
     div_w = _psxdiv20_weight_map()
     if not div_w:
         print("  Could not load PSXDIV20; using fund weights only.")
         blend_mode = "mf"
+    elif blend_mode != "mf" and shariah_fund:
+        div_w = _apply_shariah_filter_to_div20(div_w, enabled=True)
+        if not div_w and blend_mode != "mf":
+            print("  Falling back to mutual fund top-10 only.")
+            blend_mode = "mf"
     target_w = _blend_weight_maps(mf_w, div_w, blend_mode)
     if not target_w:
-        print("  Empty basket (e.g. no overlap). Try option d or b.")
+        print("  Empty basket — try option 1 (full fund top-10) or 3 (combined).")
         return
 
     mode_labels = {
-        "mf": f"{mf_label} top-10",
-        "div20": "PSXDIV20 index",
-        "overlap": f"{mf_label} ∩ PSXDIV20 (avg weights)",
-        "union": f"{mf_label} ∪ PSXDIV20 (blended)",
+        "mf": f"{mf_label} top-10 (all FMR stocks)",
+        "div20": "PSXDIV20 index"
+        + (" (KMI30-filtered)" if shariah_fund else ""),
+        "overlap": f"Overlap only ({overlap_n} symbols)",
+        "combined": f"{mf_label} + PSXDIV20 (50/50 blend)"
+        + (" · Shariah PSXDIV20" if shariah_fund else ""),
+        "union": f"{mf_label} + PSXDIV20 (merged weights)"
+        + (" · Shariah PSXDIV20" if shariah_fund else ""),
     }
     title = mode_labels.get(blend_mode, "Dividend blend")
     df = _dataframe_from_weight_map(target_w, title=title)
