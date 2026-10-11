@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.2.2"
+__version__ = "1.2.4"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -928,11 +928,14 @@ def print_usage_tips() -> None:
         """
 Quick reference (type h or ? at any menu):
   • Index & ETF (menus 1 & 2): new plan, top-up, scope, exclusions, snapshots.
-  • Custom basket (menu 5): blue-chip pool + dividend + 1y blend — not one index/ETF.
+  • Custom basket (menu 5): standard blend or dividend-income aim (PSXDIV20 tips).
+  • Dividend portfolio (menu 6): PSXDIV20 index or yield-weighted dividend basket → SIP.
+  • Stock scanner (menu 7): filter screener (P/E, yield, …) + optional EPS / profit from PSX.
   • Top-up: mode 2 → then 1 held weights / 2 equal split / 3 benchmark gap-fill.
   • Snapshot load shows basket drift (new/dropped names, weight shifts).
   • Match check (menu 4): Index or ETF → CSV or SYMBOL:qty → resemblance %.
   • Paths: relative (from cwd), absolute, or ~/file.csv — all work.
+  • Multi-select indices/ETFs: type all (or *) to select every item in the list.
   • Env: PSX_SIP_HOLDINGS=/path/to.csv skips the load menu in top-up.
   • Lost file? Top-up menu 2 (plan CSV) or 3 (SYMBOL:qty, e.g. FFC:1500).
   • Local reminder only: ~/.psx-sip/user_state.json (last file path). Set
@@ -983,6 +986,12 @@ def choose_product_type() -> str:
     print(
         "  5. Custom basket SIP (blue-chip + dividend + growth blend)"
     )
+    print(
+        "  6. Dividend portfolio (PSXDIV20 or yield-focused basket → SIP)"
+    )
+    print(
+        "  7. Stock scanner (P/E, dividend yield, EPS — research filter)"
+    )
     print("  h. Help (shortcuts)")
     print()
     while True:
@@ -1000,7 +1009,11 @@ def choose_product_type() -> str:
             return "align"
         if choice in ("5", "custom", "basket", "smart", "blend"):
             return "custom"
-        print("  Enter 1, 2, 3, 4, 5, or h.")
+        if choice in ("6", "dividend", "div", "income", "yield"):
+            return "dividend_portfolio"
+        if choice in ("7", "scan", "scanner", "screener", "screen"):
+            return "scanner"
+        print("  Enter 1–7, or h.")
 
 
 def prompt_return_to_menu() -> bool:
@@ -1309,6 +1322,17 @@ def prompt_non_negative_float(label: str, default: float) -> float:
     return value
 
 
+def prompt_optional_float(label: str, *, hint: str = "blank = no limit") -> float | None:
+    raw = prompt(f"{label} ({hint}): ").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw.replace(",", ""))
+    except ValueError:
+        print("  Ignoring invalid number — no limit.")
+        return None
+
+
 _INDEX_ALIASES = {
     "KSE100": "KSE100",
     "KSE100PR": "KSE100PR",
@@ -1325,7 +1349,14 @@ def _resolve_index_token(token: str) -> str | None:
     return None
 
 
+def _is_select_all_choice(raw: str) -> bool:
+    key = raw.strip().lower()
+    return key in ("all", "a", "*", "everything", "full")
+
+
 def _parse_index_selection(raw: str) -> list[str]:
+    if _is_select_all_choice(raw):
+        return list(INDEX_NAMES)
     selected: list[str] = []
     seen: set[str] = set()
     parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
@@ -1353,10 +1384,11 @@ def choose_indices_multi(*, allow_empty: bool = False) -> list[str]:
     for i, name in enumerate(INDEX_NAMES, start=1):
         print(f"  {i:2}. {name}")
     print(
-        "\n  Tip: comma-separate for several (e.g. 1,3,6 or KSE100,KMI30)."
+        "\n  Tip: comma-separate for several (e.g. 1,3,6 or KSE100,KMI30), "
+        "or type all for every index."
     )
     while True:
-        raw = prompt("Select indices (numbers or names): ")
+        raw = prompt("Select indices (numbers, names, or all): ")
         picked = _parse_index_selection(raw)
         if picked:
             print(f"  Selected {len(picked)} index(es): {', '.join(picked)}")
@@ -1382,12 +1414,16 @@ def choose_etfs_multi(*, allow_empty: bool = False) -> list[tuple[str, str]]:
         print(f"  {len(symbols):2}. {sym} — {row['name']}")
     valid = set(symbols)
     print(
-        "\n  Tip: comma-separate for several (e.g. 1,2 or MZNPETF,UBLPETF)."
+        "\n  Tip: comma-separate for several (e.g. 1,2 or MZNPETF,UBLPETF), "
+        "or type all for every ETF."
     )
     while True:
-        raw = prompt("Select ETFs (numbers or symbols): ")
+        raw = prompt("Select ETFs (numbers, symbols, or all): ")
         if allow_empty and not raw.strip():
             return []
+        if _is_select_all_choice(raw):
+            print(f"  Selected all {len(symbols)} ETF(s): {', '.join(symbols)}")
+            return [(s, names_by_symbol[s]) for s in symbols]
 
         picked_syms: list[str] = []
         seen: set[str] = set()
@@ -1531,6 +1567,7 @@ def _rank_score(series: pd.Series) -> pd.Series:
 
 
 _company_annual_eps_cache: dict[str, list[float]] = {}
+_company_financials_cache: dict[str, dict[str, list[float]]] = {}
 _ANNUAL_YEAR_RE = re.compile(r"^20\d{2}$")
 
 
@@ -1542,8 +1579,9 @@ def _fetch_company_page_html(symbol: str) -> str:
     return resp.text
 
 
-def _parse_company_annual_eps(html: str) -> list[float]:
-    """Newest annual EPS first (from PSX /company/SYM highlights table)."""
+def _parse_company_annual_row(html: str, row_label: str) -> list[float]:
+    """Newest annual values first (PSX /company/SYM annual financials table)."""
+    want = row_label.strip().lower()
     soup = BeautifulSoup(html, "html.parser")
     for table in soup.select("table"):
         rows = table.select("tr")
@@ -1558,7 +1596,7 @@ def _parse_company_annual_eps(html: str) -> list[float]:
             continue
         for tr in rows[1:]:
             cells = [c.get_text(strip=True) for c in tr.select("td")]
-            if not cells or cells[0].strip().upper() != "EPS":
+            if not cells or cells[0].strip().lower() != want:
                 continue
             pairs: list[tuple[int, float]] = []
             for year_s, raw in zip(year_cols, cells[1:]):
@@ -1575,17 +1613,37 @@ def _parse_company_annual_eps(html: str) -> list[float]:
     return []
 
 
-def _company_annual_eps_values(symbol: str) -> list[float]:
+def _parse_company_annual_eps(html: str) -> list[float]:
+    return _parse_company_annual_row(html, "EPS")
+
+
+def _company_financials(symbol: str) -> dict[str, list[float]]:
     sym = symbol.upper()
-    if sym in _company_annual_eps_cache:
-        return _company_annual_eps_cache[sym]
+    if sym in _company_financials_cache:
+        return _company_financials_cache[sym]
     try:
         html = _fetch_company_page_html(sym)
-        values = _parse_company_annual_eps(html)
+        fin = {
+            "eps": _parse_company_annual_row(html, "EPS"),
+            "profit_after_tax": _parse_company_annual_row(
+                html, "Profit after Taxation"
+            ),
+        }
     except Exception:
-        values = []
-    _company_annual_eps_cache[sym] = values
-    return values
+        fin = {"eps": [], "profit_after_tax": []}
+    _company_financials_cache[sym] = fin
+    _company_annual_eps_cache[sym] = fin.get("eps") or []
+    return fin
+
+
+def _company_annual_eps_values(symbol: str) -> list[float]:
+    return _company_financials(symbol).get("eps") or []
+
+
+def _yoy_pct(values: list[float]) -> float | None:
+    if len(values) < 2 or not values[1]:
+        return None
+    return (values[0] - values[1]) / abs(values[1]) * 100.0
 
 
 def _consecutive_eps_decline(values: list[float], years: int) -> bool:
@@ -1699,14 +1757,43 @@ def _build_screener_enriched() -> pd.DataFrame:
         out.get("change_1y_pct"), errors="coerce"
     ).fillna(0.0)
     out["market_cap"] = pd.to_numeric(out.get("market_cap"), errors="coerce").fillna(0.0)
+    out["pe_ratio"] = pd.to_numeric(out.get("pe_ratio"), errors="coerce")
     return out
 
 
-def choose_custom_basket_pool() -> tuple[list[str], list[str]]:
+def print_dividend_income_strategy_tips() -> None:
+    print(
+        """
+Dividend-income checklist (research summary — not advice):
+  • Prefer consistent payers (5+ years of cash dividends), not one-off specials.
+  • Watch payout vs earnings; very high yield (often 15%+) can mean a cut is priced in.
+  • Diversify sectors (banking, energy, fertilizer, power, consumer) — PSX is yield-heavy
+    but sector shocks (rates, oil, policy) cluster.
+  • PSX publishes PSXDIV20 — top dividend names by yield + history; good research universe.
+  • Reinvest dividends for compounding; review holdings at least quarterly.
+  • This planner scores yield + blue-chip index weight + 1y price — verify fundamentals
+    on PSX company pages before you buy.
+
+Suggested planner knobs for income focus:
+  Pool: PSXDIV20 (or KSE100+KSE30 for a wider list)
+  Blend: Income tilt (20% blue chip / 50% dividend / 30% growth)
+  Basket size: 6–10 names · Min yield filter: 4–6% · Keep sector cap on (default 3/name)
+""".strip()
+    )
+
+
+def choose_custom_basket_pool(
+    *, dividend_profile: bool = False
+) -> tuple[list[str], list[str]]:
+    if dividend_profile:
+        print("\nDividend-income pool: PSXDIV20 constituents (PSX Dividend 20 index).\n")
+        return (["PSXDIV20"], [])
+
     print("\nBuild candidate pool from:\n")
     print("  1. KSE100 constituents only")
     print("  2. KSE100 + KSE30 (union — larger blue-chip pool)")
-    print("  3. KSE100 + KSE30 + selected ETF equity baskets")
+    print("  3. KSE100 + KSE30 + selected ETF equity baskets (type all at ETF pick)")
+    print("  4. PSXDIV20 only (dividend-focused index)")
     print()
     while True:
         choice = prompt("Select [2]: ") or "2"
@@ -1717,7 +1804,29 @@ def choose_custom_basket_pool() -> tuple[list[str], list[str]]:
         if choice in ("3", "etf", "mix"):
             etfs = choose_etfs_multi(allow_empty=False)
             return (["KSE100", "KSE30"], [s for s, _ in etfs])
-        print("  Enter 1, 2, or 3.")
+        if choice in ("4", "div", "dividend", "psxdiv20", "div20"):
+            return (["PSXDIV20"], [])
+        print("  Enter 1, 2, 3, or 4.")
+
+
+def choose_custom_basket_mode() -> str:
+    print("\nCustom basket mode:\n")
+    print("  1. Standard — you pick pool, blend, and filters")
+    print(
+        "  2. Dividend-income aim — PSXDIV20 pool, income tilt, "
+        "strategy tips (h for help anytime)"
+    )
+    print()
+    while True:
+        choice = prompt("Select [1]: ") or "1"
+        if choice in ("1", "standard", "s"):
+            return "standard"
+        if choice in ("2", "dividend", "div", "income", "i"):
+            return "dividend"
+        if _is_help_choice(choice):
+            print_dividend_income_strategy_tips()
+            continue
+        print("  Enter 1 or 2.")
 
 
 def choose_custom_basket_blend() -> tuple[float, float, float]:
@@ -1911,6 +2020,425 @@ def build_smart_custom_basket(
     return df.sort_values("idx_weight", ascending=False).reset_index(drop=True)
 
 
+def _dataframe_to_sip_basket(
+    sel: pd.DataFrame,
+    *,
+    weight_col: str,
+    basket_id: str,
+    title: str,
+) -> pd.DataFrame:
+    """Normalize weights and ensure prices for SIP planning."""
+    price_ok: list[dict] = []
+    for _, row in sel.iterrows():
+        sym = str(row["symbol"]).upper()
+        price = row.get("price")
+        if price is None or (isinstance(price, float) and math.isnan(price)):
+            price = _fallback_price_from_history(sym)
+        if price is None:
+            continue
+        w = float(row.get(weight_col, 0.0) or 0.0)
+        if w <= 0:
+            continue
+        price_ok.append(
+            {
+                "symbol": sym,
+                "name": str(row.get("name", sym)),
+                "sector_name": str(row.get("sector_name", "UNKNOWN")),
+                "price": float(price),
+                "idx_weight": w,
+                "dividend_yield": float(row.get("dividend_yield", 0.0) or 0.0),
+            }
+        )
+    if not price_ok:
+        print("  Could not price any selected names.")
+        sys.exit(1)
+    df = pd.DataFrame(price_ok)
+    total = df["idx_weight"].sum()
+    if total <= 0:
+        df["idx_weight"] = 100.0 / len(df)
+    else:
+        df["idx_weight"] = df["idx_weight"] / total * 100.0
+    return df.sort_values("idx_weight", ascending=False).reset_index(drop=True)
+
+
+def build_yield_weighted_dividend_basket(
+    pool_symbols: set[str],
+    *,
+    target_count: int,
+    min_div_yield: float,
+    max_per_sector: int,
+    exclude_eps_decliners: bool,
+) -> pd.DataFrame:
+    scr = _build_screener_enriched()
+    scr = scr[scr["symbol"].isin(pool_symbols)].copy()
+    if min_div_yield > 0:
+        scr = scr[scr["dividend_yield"] >= min_div_yield].copy()
+    if scr.empty:
+        print("  No screener names match the dividend pool/filters.")
+        sys.exit(1)
+
+    if exclude_eps_decliners:
+        keep_rows: list[pd.Series] = []
+        n = len(scr)
+        print(f"  Checking annual EPS on PSX company pages ({n} names)…")
+        for i, (_, row) in enumerate(scr.iterrows(), start=1):
+            if i == 1 or i == n or i % 15 == 0:
+                print(f"    … {i}/{n}", flush=True)
+            sym = str(row["symbol"]).upper()
+            eps_vals = _company_annual_eps_values(sym)
+            _note, exclude = _describe_eps_trend(eps_vals)
+            if not exclude:
+                keep_rows.append(row)
+        if not keep_rows:
+            print("  All names failed EPS quality filter.")
+            sys.exit(1)
+        scr = pd.DataFrame(keep_rows)
+
+    scr = scr.sort_values("dividend_yield", ascending=False)
+    picked: list[pd.Series] = []
+    sector_counts: dict[str, int] = {}
+    for _, row in scr.iterrows():
+        sec = str(row["sector_name"])
+        if sector_counts.get(sec, 0) >= max_per_sector:
+            continue
+        sector_counts[sec] = sector_counts.get(sec, 0) + 1
+        picked.append(row)
+        if len(picked) >= target_count:
+            break
+    if not picked:
+        print("  Could not pick any stocks.")
+        sys.exit(1)
+    sel = pd.DataFrame(picked)
+    sel["idx_weight"] = sel["dividend_yield"].clip(lower=0.01)
+    return _dataframe_to_sip_basket(
+        sel, weight_col="idx_weight", basket_id="", title=""
+    )
+
+
+def choose_dividend_portfolio_style() -> str:
+    print("\nDividend portfolio style:\n")
+    print("  1. PSXDIV20 — official PSX Dividend 20 index weights (SIP like menu 1)")
+    print(
+        "  2. PSXDIV20 yield basket — top names by dividend yield "
+        "(weights ∝ yield, EPS filter optional)"
+    )
+    print(
+        "  3. Full market scan — highest yield across PSX screener "
+        "(min yield filter, sector cap)"
+    )
+    while True:
+        choice = prompt("Select [1]: ") or "1"
+        if choice in ("1", "index", "psxdiv20", "div20"):
+            return "index"
+        if choice in ("2", "div20", "pool"):
+            return "div20_yield"
+        if choice in ("3", "scan", "market", "all"):
+            return "market_yield"
+        print("  Enter 1, 2, or 3.")
+
+
+def run_dividend_portfolio_flow() -> None:
+    print(
+        "\nDividend portfolio — build a yield-focused holding set for SIP planning.\n"
+        "  For managed mutual funds (e.g. Meezan Dividend Yield), use fund reports;\n"
+        "  this menu is for direct PSX stocks / PSXDIV20.\n"
+        "  Not investment advice."
+    )
+    print_dividend_income_strategy_tips()
+    style = choose_dividend_portfolio_style()
+
+    if style == "index":
+        df, meta = load_index_frame("PSXDIV20")
+        print_overview_tables(df, "PSXDIV20")
+        _run_benchmark_sip_flow(
+            df,
+            meta,
+            source_type="index",
+            source_id="PSXDIV20",
+            universe_label="PSXDIV20",
+            weight_label="index",
+            empty_exclusion_msg="All constituents were excluded. Nothing to allocate.",
+            exclusion_unit="constituents",
+        )
+        return
+
+    target_count = int(
+        prompt_positive_float(
+            "\nHow many stocks in the dividend basket (typical 8–20)", 12.0
+        )
+    )
+    target_count = max(3, min(40, target_count))
+    min_div = prompt_non_negative_float("Minimum dividend yield %", 4.0)
+    eps_filter = prompt(
+        "Drop names with annual EPS down 2+ years in a row? [Y/n]: "
+    ).lower()
+    exclude_eps = eps_filter not in ("n", "no")
+
+    if style == "div20_yield":
+        pool = set(_index_constituent_weights("PSXDIV20")["symbol"].astype(str))
+        basket_id = "dividend_psxdiv20"
+        label = "PSXDIV20 yield basket"
+    else:
+        scr = _build_screener_enriched()
+        pool = set(scr["symbol"].astype(str))
+        basket_id = "dividend_screener"
+        label = "Screener yield basket"
+
+    print(f"\nBuilding {label}…")
+    df = build_yield_weighted_dividend_basket(
+        pool,
+        target_count=target_count,
+        min_div_yield=min_div,
+        max_per_sector=CUSTOM_BASKET_MAX_PER_SECTOR,
+        exclude_eps_decliners=exclude_eps,
+    )
+
+    print(f"\n{'=' * 72}")
+    print(f"  {label} ({len(df)} names, weights ∝ dividend yield)")
+    print(f"{'=' * 72}\n")
+    show = df[["symbol", "name", "sector_name", "price", "idx_weight", "dividend_yield"]].copy()
+    show["price"] = show["price"].map(lambda p: f"{p:,.2f}")
+    show["idx_weight"] = show["idx_weight"].map(lambda w: f"{w:.2f}%")
+    show["dividend_yield"] = show["dividend_yield"].map(lambda v: f"{v:.2f}%")
+    show = show.rename(columns={"idx_weight": "target_weight"})
+    print(show.to_string(index=False))
+
+    confirm = prompt("\nUse this basket for SIP planning? [Y/n]: ").lower()
+    if confirm in ("n", "no"):
+        print("  Cancelled.")
+        return
+
+    meta = {
+        "index_name": basket_id,
+        "as_of": _utc_now_iso(),
+        "title": label,
+        "parsed_holdings": [],
+        "missing_price_symbols": [],
+    }
+    _run_benchmark_sip_flow(
+        df,
+        meta,
+        source_type="custom",
+        source_id=basket_id,
+        universe_label="dividend basket",
+        weight_label="target",
+        empty_exclusion_msg="All names were excluded. Nothing to allocate.",
+        exclusion_unit="names",
+    )
+
+
+def _filter_screener_scanner(scr: pd.DataFrame) -> pd.DataFrame:
+    print(
+        "\n  Filters use the live PSX screener. "
+        "Leave blank at any prompt for no limit on that field.\n"
+        "  Note: PSX company pages show annual EPS and profit after tax (000's); "
+        "operating cash flow is not published on that page.\n"
+    )
+    min_pe = prompt_optional_float("Minimum P/E ratio")
+    max_pe = prompt_optional_float("Maximum P/E ratio")
+    min_div = prompt_optional_float("Minimum dividend yield %")
+    max_div = prompt_optional_float("Maximum dividend yield %")
+    min_cap = prompt_optional_float("Minimum market cap (PKR, as on screener)")
+    min_1y = prompt_optional_float("Minimum 1-year price change %")
+    sector_raw = prompt("Sector name contains (optional): ").strip()
+    out = scr.copy()
+    out["pe_ratio"] = pd.to_numeric(out["pe_ratio"], errors="coerce")
+
+    if min_pe is not None:
+        out = out[out["pe_ratio"].fillna(-1) >= min_pe]
+    if max_pe is not None:
+        out = out[(out["pe_ratio"].notna()) & (out["pe_ratio"] <= max_pe)]
+    if min_div is not None:
+        out = out[out["dividend_yield"] >= min_div]
+    if max_div is not None:
+        out = out[out["dividend_yield"] <= max_div]
+    if min_cap is not None:
+        out = out[out["market_cap"] >= min_cap]
+    if min_1y is not None:
+        out = out[out["change_1y_pct"] >= min_1y]
+    if sector_raw:
+        needle = sector_raw.lower()
+        out = out[
+            out["sector_name"].astype(str).str.lower().str.contains(needle, na=False)
+        ]
+    return out.reset_index(drop=True)
+
+
+def _enrich_scanner_with_company_pages(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    cap = 80
+    if len(df) > cap:
+        print(
+            f"  Enriching first {cap} rows (of {len(df)}) with PSX company pages…"
+        )
+        work = df.head(cap).copy()
+    else:
+        work = df.copy()
+        print(f"  Enriching {len(work)} row(s) with PSX company pages…")
+
+    eps_latest: list[float | None] = []
+    eps_notes: list[str] = []
+    profit_yoy: list[float | None] = []
+    for i, sym in enumerate(work["symbol"].astype(str).str.upper(), start=1):
+        if i == 1 or i == len(work) or i % 10 == 0:
+            print(f"    … {i}/{len(work)}", flush=True)
+        fin = _company_financials(sym)
+        eps = fin.get("eps") or []
+        pat = fin.get("profit_after_tax") or []
+        eps_latest.append(eps[0] if eps else None)
+        note, _ex = _describe_eps_trend(eps)
+        eps_notes.append(note)
+        profit_yoy.append(_yoy_pct(pat))
+
+    work["eps_latest"] = eps_latest
+    work["eps_trend"] = eps_notes
+    work["profit_yoy_pct"] = profit_yoy
+    return work
+
+
+def run_stock_scanner_flow() -> None:
+    print(
+        "\nStock scanner — filter PSX screener, optionally pull EPS / profit from "
+        "company pages.\n"
+        "  Research tool only; not investment advice."
+    )
+    print("\nFetching screener…")
+    scr = _build_screener_enriched()
+    filtered = _filter_screener_scanner(scr)
+    print(f"\n  {len(filtered)} symbol(s) after screener filters (from {len(scr)}).")
+    if filtered.empty:
+        print("  No matches. Widen filters and try again.")
+        return
+
+    sort_choice = prompt(
+        "Sort by [1] dividend yield  [2] P/E (low first)  [3] 1y change  [4] market cap [1]: "
+    ) or "1"
+    sort_map = {
+        "1": ("dividend_yield", False),
+        "2": ("pe_ratio", True),
+        "3": ("change_1y_pct", False),
+        "4": ("market_cap", False),
+        "yield": ("dividend_yield", False),
+        "pe": ("pe_ratio", True),
+        "1y": ("change_1y_pct", False),
+        "cap": ("market_cap", False),
+    }
+    col, asc = sort_map.get(sort_choice.strip().lower(), ("dividend_yield", False))
+    filtered = filtered.sort_values(col, ascending=asc, na_position="last")
+
+    enrich = prompt(
+        "Fetch EPS & profit-after-tax from PSX company pages for matches? [y/N]: "
+    ).lower()
+    if enrich in ("y", "yes"):
+        min_eps = prompt_optional_float("Minimum latest annual EPS (PKR)")
+        exclude_eps = prompt(
+            "Drop names with EPS down 2+ years in a row? [Y/n]: "
+        ).lower()
+        drop_eps_slide = exclude_eps not in ("n", "no")
+        min_pat_yoy = prompt_optional_float(
+            "Minimum profit-after-tax YoY % (latest vs prior year)"
+        )
+        filtered = _enrich_scanner_with_company_pages(filtered)
+        if min_eps is not None:
+            filtered = filtered[
+                filtered["eps_latest"].fillna(-1e9) >= min_eps
+            ]
+        if drop_eps_slide:
+            filtered = filtered[
+                ~filtered["eps_trend"].astype(str).str.contains("↓", regex=False)
+            ]
+        if min_pat_yoy is not None:
+            filtered = filtered[
+                filtered["profit_yoy_pct"].fillna(-1e9) >= min_pat_yoy
+            ]
+        print(f"  {len(filtered)} symbol(s) after company-page filters.")
+
+    max_show = int(prompt_positive_float("How many rows to display", 40.0))
+    max_show = max(5, min(200, max_show))
+    view = filtered.head(max_show)
+
+    cols = [
+        "symbol",
+        "name",
+        "sector_name",
+        "price",
+        "pe_ratio",
+        "dividend_yield",
+        "change_1y_pct",
+        "market_cap",
+    ]
+    if "eps_latest" in view.columns:
+        cols.extend(["eps_latest", "eps_trend", "profit_yoy_pct"])
+    show = view[[c for c in cols if c in view.columns]].copy()
+    if "price" in show.columns:
+        show["price"] = show["price"].map(lambda p: f"{p:,.2f}" if pd.notna(p) else "")
+    if "pe_ratio" in show.columns:
+        show["pe_ratio"] = show["pe_ratio"].map(
+            lambda v: f"{v:.2f}" if pd.notna(v) else "—"
+        )
+    if "dividend_yield" in show.columns:
+        show["dividend_yield"] = show["dividend_yield"].map(
+            lambda v: f"{v:.2f}%" if pd.notna(v) else ""
+        )
+    if "change_1y_pct" in show.columns:
+        show["change_1y_pct"] = show["change_1y_pct"].map(
+            lambda v: f"{v:+.1f}%" if pd.notna(v) else ""
+        )
+    if "profit_yoy_pct" in show.columns:
+        show["profit_yoy_pct"] = show["profit_yoy_pct"].map(
+            lambda v: f"{v:+.1f}%" if pd.notna(v) else "—"
+        )
+
+    print(f"\n{'=' * 72}")
+    print(f"  Scanner results (showing {len(show)} of {len(filtered)})")
+    print(f"{'=' * 72}\n")
+    print(show.to_string(index=False))
+
+    export = prompt("\nSave full filtered list to CSV? [y/N]: ").lower()
+    if export in ("y", "yes"):
+        default_name = f"psx_scan_{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv"
+        path = prompt(f"File path [{default_name}]: ").strip() or default_name
+        path = os.path.expanduser(path)
+        filtered.to_csv(path, index=False)
+        print(f"  Wrote {len(filtered)} row(s) to {path}")
+
+    build = prompt(
+        "\nBuild a dividend-weighted SIP basket from these results? [y/N]: "
+    ).lower()
+    if build not in ("y", "yes"):
+        return
+    take = int(
+        prompt_positive_float(
+            f"How many top names to include (max {len(filtered)})",
+            float(min(12, len(filtered))),
+        )
+    )
+    take = max(3, min(len(filtered), take))
+    basket = filtered.head(take).copy()
+    basket["idx_weight"] = basket["dividend_yield"].clip(lower=0.01)
+    df = _dataframe_to_sip_basket(basket, weight_col="idx_weight", basket_id="", title="")
+    basket_id = prompt("Basket label [scanner_dividend]: ").strip() or "scanner_dividend"
+    basket_id = re.sub(r"[^\w\-]+", "_", basket_id)[:40]
+    meta = {
+        "index_name": basket_id,
+        "as_of": _utc_now_iso(),
+        "title": f"Scanner basket {basket_id}",
+        "parsed_holdings": [],
+        "missing_price_symbols": [],
+    }
+    _run_benchmark_sip_flow(
+        df,
+        meta,
+        source_type="custom",
+        source_id=basket_id,
+        universe_label="scanner basket",
+        weight_label="target",
+        empty_exclusion_msg="All names were excluded. Nothing to allocate.",
+        exclusion_unit="names",
+    )
+
+
 def run_custom_basket_flow() -> None:
     print(
         "\nCustom basket SIP — blend blue-chip index/ETF names with "
@@ -1918,18 +2446,49 @@ def run_custom_basket_flow() -> None:
         "  Mid-term / swing-friendly: you choose the mix, not a single index or ETF.\n"
         "  Not investment advice — review names before you buy."
     )
-    index_names, etf_symbols = choose_custom_basket_pool()
-    w_blue, w_div, w_growth = choose_custom_basket_blend()
-    target_count = int(
-        prompt_positive_float(
-            f"\nHow many stocks in the basket (typical {CUSTOM_BASKET_DEFAULT_COUNT})",
-            float(CUSTOM_BASKET_DEFAULT_COUNT),
+    mode = choose_custom_basket_mode()
+    dividend_profile = mode == "dividend"
+    if dividend_profile:
+        print_dividend_income_strategy_tips()
+        print()
+
+    index_names, etf_symbols = choose_custom_basket_pool(
+        dividend_profile=dividend_profile
+    )
+    if dividend_profile:
+        w_blue, w_div, w_growth = 0.20, 0.50, 0.30
+        print(
+            "\n  Using income tilt blend: 20% blue chip / 50% dividend / 30% 1y growth."
         )
-    )
+        target_count = 8
+        min_div = 4.0
+        print(
+            f"  Defaults: {target_count} stocks, minimum dividend yield {min_div:g}%."
+        )
+        override = prompt("Change defaults? [y/N]: ").lower()
+        if override in ("y", "yes"):
+            w_blue, w_div, w_growth = choose_custom_basket_blend()
+            target_count = int(
+                prompt_positive_float(
+                    f"\nHow many stocks in the basket (typical 8)",
+                    8.0,
+                )
+            )
+            min_div = prompt_non_negative_float(
+                "Minimum dividend yield % (0 = no filter)", min_div
+            )
+    else:
+        w_blue, w_div, w_growth = choose_custom_basket_blend()
+        target_count = int(
+            prompt_positive_float(
+                f"\nHow many stocks in the basket (typical {CUSTOM_BASKET_DEFAULT_COUNT})",
+                float(CUSTOM_BASKET_DEFAULT_COUNT),
+            )
+        )
+        min_div = prompt_non_negative_float(
+            "Minimum dividend yield % (0 = no filter)", 0.0
+        )
     target_count = max(3, min(40, target_count))
-    min_div = prompt_non_negative_float(
-        "Minimum dividend yield % (0 = no filter)", 0.0
-    )
     eps_filter = prompt(
         "Drop names with annual EPS down 2+ years in a row (PSX data)? [Y/n]: "
     ).lower()
@@ -3759,6 +4318,10 @@ def main() -> None:
             run_holdings_align_flow()
         elif product == "custom":
             run_custom_basket_flow()
+        elif product == "dividend_portfolio":
+            run_dividend_portfolio_flow()
+        elif product == "scanner":
+            run_stock_scanner_flow()
         else:
             run_index_flow()
 
