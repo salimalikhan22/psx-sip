@@ -2531,7 +2531,11 @@ def run_dividend_mf_psxdiv20_sip_flow() -> None:
     title = mode_labels.get(blend_mode, "Dividend blend")
     df = _dataframe_from_weight_map(target_w, title=title)
 
+    mf_syms = set(mf_w.keys())
+    from_mf = [s for s in df["symbol"] if s in mf_syms]
     print(f"\n--- Your target basket: {title} ({len(df)} stocks) ---")
+    if blend_mode != "div20":
+        print(f"  Includes {len(from_mf)} of {len(mf_syms)} mutual fund top-10 names.")
     show = df[["symbol", "name", "idx_weight"]].copy()
     show["idx_weight"] = show["idx_weight"].map(lambda w: f"{w:.2f}%")
     show = show.rename(columns={"idx_weight": "target_weight"})
