@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.2.9"
+__version__ = "1.3.1"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -929,7 +929,10 @@ def print_usage_tips() -> None:
 Quick reference (type h or ? at any menu):
   • Index & ETF (menus 1 & 2): new plan, top-up, scope, exclusions, snapshots.
   • Stock scanner (menu 5): filter screener (P/E, yield, …) + optional EPS / profit from PSX.
-  • Top-up: mode 2 → then 1 held weights / 2 equal split / 3 benchmark gap-fill.
+  • Top-up: 1 held weights / 2 equal / 3 benchmark gap-fill / 4 dividend tilt.
+  • Top-up: optional sector/symbol exclusions (e.g. skip CEMENT this month).
+  • Top-up: optional P/E cap + EPS quality screen — swap in other basket names.
+  • Dividend-focused SIP: main menu 6 (PSXDIV20, fund blends, yield basket).
   • Snapshot load shows basket drift (new/dropped names, weight shifts).
   • Match check (menu 4): Index or ETF → CSV or SYMBOL:qty → resemblance %.
   • Paths: relative (from cwd), absolute, or ~/file.csv — all work.
@@ -984,6 +987,9 @@ def choose_product_type() -> str:
     print(
         "  5. Stock scanner (P/E, dividend yield, EPS — research filter)"
     )
+    print(
+        "  6. Dividend SIP (PSXDIV20, fund reference, yield-weighted basket)"
+    )
     print("  h. Help (shortcuts)")
     print()
     while True:
@@ -1001,10 +1007,19 @@ def choose_product_type() -> str:
             return "align"
         if choice in ("5", "7", "scan", "scanner", "screener", "screen"):
             return "scanner"
-        if choice in ("custom", "basket", "smart", "blend", "dividend", "div", "income", "yield", "6"):
-            print("  Custom basket and dividend menus were removed (v1.2.9). Try 1–5.")
-            continue
-        print("  Enter 1–5, or h.")
+        if choice in (
+            "6",
+            "custom",
+            "basket",
+            "smart",
+            "blend",
+            "dividend",
+            "div",
+            "income",
+            "yield",
+        ):
+            return "dividend"
+        print("  Enter 1–6, or h.")
 
 
 def prompt_return_to_menu() -> bool:
@@ -3137,6 +3152,307 @@ def parse_symbol_list(raw: str, valid: set[str]) -> set[str]:
     return {t for t in tokens if t in valid}
 
 
+def _dividend_yield_by_symbol() -> dict[str, float]:
+    scr = _build_screener_enriched()
+    if scr.empty or "dividend_yield" not in scr.columns:
+        return {}
+    out: dict[str, float] = {}
+    for _, row in scr.iterrows():
+        sym = str(row["symbol"]).upper()
+        val = pd.to_numeric(row.get("dividend_yield"), errors="coerce")
+        out[sym] = float(val) if pd.notna(val) else 0.0
+    return out
+
+
+def apply_dividend_yield_weights(df: pd.DataFrame) -> pd.DataFrame:
+    """Renormalize idx_weight by live screener dividend yield."""
+    yields = _dividend_yield_by_symbol()
+    if not yields:
+        print("  Could not load screener yields — keeping basket weights.")
+        return df
+    out = df.copy()
+    sym = out["symbol"].astype(str).str.upper()
+    dy = sym.map(lambda s: max(float(yields.get(s, 0.0) or 0.0), 0.01))
+    total = float(dy.sum())
+    if total <= 0:
+        return df
+    out["idx_weight"] = dy / total * 100.0
+    return out.sort_values("idx_weight", ascending=False).reset_index(drop=True)
+
+
+def _pe_ratio_by_symbol() -> dict[str, float]:
+    scr = _build_screener_enriched()
+    if scr.empty or "pe_ratio" not in scr.columns:
+        return {}
+    out: dict[str, float] = {}
+    for _, row in scr.iterrows():
+        sym = str(row["symbol"]).upper()
+        pe = pd.to_numeric(row.get("pe_ratio"), errors="coerce")
+        if pd.notna(pe):
+            out[sym] = float(pe)
+    return out
+
+
+def _symbol_quality_check(
+    sym: str,
+    *,
+    max_pe: float | None,
+    exclude_eps_decline: bool,
+    pe_map: dict[str, float],
+    eps_cache: dict[str, tuple[str, bool]],
+) -> tuple[bool, str]:
+    sym = sym.upper()
+    if max_pe is not None:
+        pe = pe_map.get(sym)
+        if pe is None:
+            return False, f"P/E unknown (cap is {max_pe:g})"
+        if pe > max_pe + 1e-9:
+            return False, f"P/E {pe:.1f} > {max_pe:g}"
+    if exclude_eps_decline:
+        if sym not in eps_cache:
+            eps_cache[sym] = _describe_eps_trend(_company_annual_eps_values(sym))
+        note, exclude = eps_cache[sym]
+        if exclude:
+            return False, note
+    return True, "ok"
+
+
+def _quality_filter_dataframe(
+    df: pd.DataFrame,
+    *,
+    max_pe: float | None,
+    exclude_eps_decline: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (kept rows, dropped rows with quality_reason)."""
+    if df.empty:
+        return df, df.iloc[0:0].copy()
+    pe_map = _pe_ratio_by_symbol()
+    eps_cache: dict[str, tuple[str, bool]] = {}
+    kept_rows: list[pd.Series] = []
+    dropped: list[dict] = []
+    n = len(df)
+    if exclude_eps_decline and n > 0:
+        print(f"  Checking annual EPS on PSX company pages ({n} name(s)…)…")
+    for i, (_, row) in enumerate(df.iterrows(), start=1):
+        sym = str(row["symbol"]).upper()
+        if exclude_eps_decline and (i == 1 or i == n or i % 5 == 0):
+            print(f"    … {i}/{n}", flush=True)
+        ok, reason = _symbol_quality_check(
+            sym,
+            max_pe=max_pe,
+            exclude_eps_decline=exclude_eps_decline,
+            pe_map=pe_map,
+            eps_cache=eps_cache,
+        )
+        if ok:
+            kept_rows.append(row)
+        else:
+            pe = pe_map.get(sym)
+            pe_s = f"{pe:.1f}" if pe is not None else "—"
+            dropped.append(
+                {
+                    "symbol": sym,
+                    "name": row.get("name", sym),
+                    "pe_ratio": pe_s,
+                    "quality_reason": reason,
+                }
+            )
+    kept = pd.DataFrame(kept_rows) if kept_rows else df.iloc[0:0].copy()
+    drop_df = pd.DataFrame(dropped)
+    return kept.reset_index(drop=True), drop_df
+
+
+def prompt_topup_quality_and_replacements(
+    scoped: pd.DataFrame,
+    live_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Drop names failing P/E or EPS rules; optionally add other benchmark lines."""
+    ans = prompt(
+        "\nSkip names with weak fundamentals on this top-up "
+        "(P/E cap and/or EPS trend)? [y/N]: "
+    ).lower()
+    if ans not in ("y", "yes"):
+        return scoped
+
+    max_pe_raw = prompt("Maximum P/E (Enter=12, type none for no cap) [12]: ").strip()
+    if max_pe_raw == "":
+        max_pe: float | None = 12.0
+    elif max_pe_raw.lower() in ("none", "no", "skip", "-", "*"):
+        max_pe = None
+    else:
+        try:
+            max_pe = float(max_pe_raw.replace(",", ""))
+        except ValueError:
+            print("  Invalid P/E — using 12.")
+            max_pe = 12.0
+
+    eps_ans = prompt("Skip EPS down 2+ years in a row? [Y/n]: ").lower()
+    exclude_eps = eps_ans not in ("n", "no")
+
+    kept, dropped = _quality_filter_dataframe(
+        scoped,
+        max_pe=max_pe,
+        exclude_eps_decline=exclude_eps,
+    )
+    if dropped.empty:
+        print("  All names in this top-up pass the quality rules.")
+        return scoped
+
+    print("\n  Removed from this month's buys (you can still hold them):")
+    print(dropped.to_string(index=False))
+
+    add_ans = prompt(
+        "\nAdd replacement(s) from the live basket that pass the same rules? [Y/n]: "
+    ).lower()
+    if add_ans in ("n", "no"):
+        if kept.empty:
+            print("  Nothing left to allocate — keeping original list.")
+            return scoped
+        return kept
+
+    live = live_df.copy()
+    live["symbol"] = live["symbol"].astype(str).str.upper()
+    in_scope = set(scoped["symbol"].astype(str).str.upper())
+    pool = live[~live["symbol"].isin(in_scope)].copy()
+    if pool.empty:
+        print("  No other basket names to add.")
+        return kept if not kept.empty else scoped
+
+    pe_map = _pe_ratio_by_symbol()
+    eps_cache: dict[str, tuple[str, bool]] = {}
+    good_rows: list[pd.Series] = []
+    n_pool = len(pool)
+    if exclude_eps:
+        print(f"  Screening {n_pool} other basket name(s)…")
+    for i, (_, row) in enumerate(pool.iterrows(), start=1):
+        sym = str(row["symbol"]).upper()
+        if exclude_eps and (i == 1 or i == n_pool or i % 5 == 0):
+            print(f"    … {i}/{n_pool}", flush=True)
+        ok, _reason = _symbol_quality_check(
+            sym,
+            max_pe=max_pe,
+            exclude_eps_decline=exclude_eps,
+            pe_map=pe_map,
+            eps_cache=eps_cache,
+        )
+        if ok:
+            good_rows.append(row)
+    candidates = pd.DataFrame(good_rows) if good_rows else pool.iloc[0:0].copy()
+    if candidates.empty:
+        print("  No basket names pass the quality rules.")
+        return kept if not kept.empty else scoped
+
+    yields = _dividend_yield_by_symbol()
+    pref = prompt(
+        "Pick replacements by [1] dividend yield  [2] basket weight [1]: "
+    ).strip() or "1"
+    if pref in ("2", "weight", "basket", "w"):
+        candidates = candidates.sort_values("idx_weight", ascending=False)
+    else:
+        candidates["dividend_yield"] = candidates["symbol"].map(
+            lambda s: float(yields.get(str(s).upper(), 0.0) or 0.0)
+        )
+        candidates = candidates.sort_values(
+            ["dividend_yield", "idx_weight"], ascending=[False, False]
+        )
+
+    default_n = max(1, len(dropped))
+    n_add = int(
+        prompt_positive_float(
+            f"How many names to add (≤ {len(candidates)} available)",
+            float(default_n),
+        )
+    )
+    n_add = max(1, min(n_add, len(candidates)))
+
+    manual = prompt(
+        "Or force symbol(s) from the list above (comma-separated, optional): "
+    ).strip()
+    picks: list[pd.Series] = []
+    if manual:
+        valid = set(candidates["symbol"].astype(str).str.upper())
+        for tok in manual.replace(";", ",").split(","):
+            sym = tok.strip().upper()
+            if sym and sym in valid:
+                row = candidates[
+                    candidates["symbol"].astype(str).str.upper() == sym
+                ].iloc[0]
+                picks.append(row)
+            elif sym:
+                print(f"  Skipping {sym} — not in quality-filtered basket pool.")
+    if not picks:
+        picks = [candidates.iloc[i] for i in range(n_add)]
+    else:
+        picks = picks[:n_add]
+
+    add_df = pd.DataFrame(picks)
+    print("\n  Adding to this top-up:")
+    show = add_df[["symbol", "name", "idx_weight"]].copy()
+    if "dividend_yield" in add_df.columns:
+        show["dividend_yield"] = add_df["dividend_yield"].map(
+            lambda v: f"{float(v):.2f}%"
+        )
+    show["idx_weight"] = show["idx_weight"].map(lambda w: f"{w:.2f}%")
+    print(show.to_string(index=False))
+
+    if kept.empty:
+        return add_df.reset_index(drop=True)
+    return (
+        pd.concat([kept, add_df], ignore_index=True)
+        .drop_duplicates(subset=["symbol"], keep="first")
+        .sort_values("idx_weight", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+def prompt_optional_topup_exclusions(
+    df: pd.DataFrame,
+    *,
+    universe_label: str,
+) -> pd.DataFrame:
+    ans = prompt(
+        "\nExclude sectors or symbols from this top-up only? [y/N]: "
+    ).lower()
+    if ans not in ("y", "yes"):
+        return df
+    exclude_sectors, exclude_symbols = prompt_exclusions(
+        df, universe_label=universe_label
+    )
+    filtered = apply_exclusions(df, exclude_sectors, exclude_symbols)
+    if filtered.empty:
+        print("  All names excluded — keeping the prior selection.")
+        return df
+    if len(filtered) < len(df):
+        print(
+            f"\n  Top-up universe: {len(filtered)} name(s) "
+            f"(excluded {len(df) - len(filtered)})."
+        )
+    return filtered
+
+
+def apply_topup_allocation_tweaks(
+    scoped: pd.DataFrame,
+    *,
+    live_df: pd.DataFrame,
+    universe_label: str,
+    topup_strategy: str,
+) -> pd.DataFrame:
+    scoped = prompt_optional_topup_exclusions(scoped, universe_label=universe_label)
+    scoped = prompt_topup_quality_and_replacements(scoped, live_df)
+    if scoped.empty:
+        return scoped
+    if topup_strategy == "dividend_tilt":
+        print(
+            "\n  Dividend tilt: this month's cash follows screener dividend yield "
+            "(not ETF/index basket weights)."
+        )
+        scoped = apply_dividend_yield_weights(scoped)
+        show = scoped[["symbol", "name", "idx_weight"]].copy()
+        show["idx_weight"] = show["idx_weight"].map(lambda w: f"{w:.2f}%")
+        print(show.to_string(index=False))
+    return scoped
+
+
 def apply_exclusions(
     df: pd.DataFrame,
     exclude_sectors: set[str],
@@ -3675,11 +3991,39 @@ def build_holdings_snapshot_rows(
     return pd.DataFrame(rows)
 
 
+def prompt_holdings_snapshot_path(default_name: str) -> str:
+    print("  Path must be a CSV file (not a folder). Relative, absolute, or ~ OK.")
+    while True:
+        path_raw = prompt(f"Holdings file path [{default_name}]: ") or default_name
+        path = resolve_user_path(path_raw)
+        if os.path.isdir(path):
+            suggested = os.path.join(path.rstrip(os.sep), default_name)
+            print(f"  {path!r} is a directory, not a file.")
+            fix = prompt(f"  Save as {suggested}? [Y/n]: ").lower()
+            if fix in ("", "y", "yes"):
+                path = suggested
+            else:
+                continue
+        parent = os.path.dirname(path)
+        if parent and not os.path.isdir(parent):
+            mk = prompt(f"  Create folder {parent}? [y/N]: ").lower()
+            if mk in ("y", "yes"):
+                os.makedirs(parent, exist_ok=True)
+            else:
+                print("  Pick another path or create the folder.")
+                continue
+        if os.path.isdir(path):
+            continue
+        return path
+
+
 def write_holdings_snapshot(
     path: str,
     table: pd.DataFrame,
     header: dict[str, str],
 ) -> None:
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"Holdings path is a directory: {path}")
     lines = [
         f"# psx-sip-holdings snapshot_version={HOLDINGS_SNAPSHOT_VERSION}",
     ]
@@ -3831,9 +4175,7 @@ def maybe_save_holdings_snapshot(
     ).lower()
     if answer not in ("", "y", "yes"):
         return
-    print("  Save as relative or absolute path (any filename you like).")
-    path_raw = prompt(f"Holdings file path [{default_name}]: ") or default_name
-    path = resolve_user_path(path_raw)
+    path = prompt_holdings_snapshot_path(default_name)
     parsed_holdings = (meta or {}).get("parsed_holdings")
     missing = (meta or {}).get("missing_price_symbols") or []
     table = build_holdings_snapshot_rows(
@@ -4108,6 +4450,15 @@ def run_holdings_align_flow() -> None:
     if scoped.empty:
         print("  No symbols to allocate; cannot top-up.")
         return
+    scoped = apply_topup_allocation_tweaks(
+        scoped,
+        live_df=live_df,
+        universe_label=universe_label_from_source(source_type, source_id),
+        topup_strategy=topup_strategy,
+    )
+    if scoped.empty:
+        print("  No symbols left after adjustments.")
+        return
     investment_pkr = prompt_positive_float(
         "\nMonthly SIP investment amount (PKR)"
     )
@@ -4230,6 +4581,10 @@ def choose_topup_strategy() -> str:
         "  3. Benchmark gap-fill — move toward full benchmark weights "
         "(may buy names you do not hold yet)"
     )
+    print(
+        "  4. Dividend tilt — among names in this top-up, weight by screener "
+        "dividend yield (income bias vs basket weights)"
+    )
     print()
     while True:
         choice = prompt("Select [1]: ") or "1"
@@ -4239,7 +4594,9 @@ def choose_topup_strategy() -> str:
             return "equal_held"
         if choice in ("3", "benchmark", "gap", "rebalance", "full"):
             return "benchmark_gap"
-        print("  Enter 1, 2, or 3.")
+        if choice in ("4", "dividend", "div", "yield", "income"):
+            return "dividend_tilt"
+        print("  Enter 1, 2, 3, or 4.")
 
 
 def print_switch_considerations(
@@ -4599,11 +4956,14 @@ def run_topup_from_prior_shares(
                 "not in live priced basket."
             )
 
-    mode_label = (
-        "equal PKR per held name"
-        if topup_strategy == "equal_held"
-        else "live weights among held names only"
-    )
+    if topup_strategy == "equal_held":
+        mode_label = "equal PKR per held name"
+    elif topup_strategy == "dividend_tilt":
+        mode_label = (
+            "held names — dividend yield weights applied after optional exclusions"
+        )
+    else:
+        mode_label = "live weights among held names only"
     print(
         f"\nTop-up mode: {len(subset)} held name(s) — {mode_label} "
         f"({source_type} {source_id})."
@@ -4634,7 +4994,24 @@ def run_topup_flow(
         snapshot_df=snap_df,
         snapshot_header=snap_header,
     )
+    label = "ETF basket" if source_type == "etf" else universe_label_from_source(source_type, source_id)
+    scoped = apply_topup_allocation_tweaks(
+        scoped,
+        live_df=live_df,
+        universe_label=label,
+        topup_strategy=topup_strategy,
+    )
     return scoped, prior, topup_strategy
+
+
+def universe_label_from_source(source_type: str, source_id: str) -> str:
+    if source_type == "index":
+        return "index"
+    if source_type == "etf":
+        return "ETF basket"
+    if source_type == "custom":
+        return "basket"
+    return source_id or "basket"
 
 
 def maybe_save_csv(plan: pd.DataFrame, default_name: str = "psx_sip_plan.csv") -> None:
@@ -4818,6 +5195,8 @@ def main() -> None:
             run_holdings_align_flow()
         elif product == "scanner":
             run_stock_scanner_flow()
+        elif product == "dividend":
+            run_dividend_portfolio_flow()
         else:
             run_index_flow()
 
