@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.3.3"
+__version__ = "1.3.4"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -929,10 +929,10 @@ def print_usage_tips() -> None:
 Quick reference (type h or ? at any menu):
   • Index & ETF (menus 1 & 2): new plan, top-up, scope, exclusions, snapshots.
   • Stock scanner (menu 5): filter screener (P/E, yield, …) + optional EPS / profit from PSX.
-  • Top-up: 1 held weights / 2 equal / 3 benchmark gap-fill / 4 dividend tilt.
+  • Top-up: 1 held weights / 2 equal / 3 gap-fill / 4 dividend tilt (blend + optional rotate 2–3 names).
   • Top-up: optional sector/symbol exclusions (e.g. skip CEMENT this month).
   • Top-up: portfolio mix + new-money ideas (sector, dividend) before you exclude anything.
-  • Top-up: optional P/E cap + EPS quality screen — swap in other basket names.
+  • Top-up: optional P/E cap + EPS screen (known P/E only; unknown passes) — or skip filter and use mix-guide deprioritize.
   • Dividend-focused SIP: main menu 6 (PSXDIV20, fund blends, yield basket).
   • Snapshot load shows basket drift (new/dropped names, weight shifts).
   • Match check (menu 4): Index or ETF → CSV or SYMBOL:qty → resemblance %.
@@ -3166,7 +3166,7 @@ def _dividend_yield_by_symbol() -> dict[str, float]:
 
 
 def apply_dividend_yield_weights(df: pd.DataFrame) -> pd.DataFrame:
-    """Renormalize idx_weight by live screener dividend yield."""
+    """Renormalize idx_weight by live screener dividend yield (100% yield — use blend for top-up)."""
     yields = _dividend_yield_by_symbol()
     if not yields:
         print("  Could not load screener yields — keeping basket weights.")
@@ -3179,6 +3179,102 @@ def apply_dividend_yield_weights(df: pd.DataFrame) -> pd.DataFrame:
         return df
     out["idx_weight"] = dy / total * 100.0
     return out.sort_values("idx_weight", ascending=False).reset_index(drop=True)
+
+
+def apply_dividend_tilt_blend(
+    df: pd.DataFrame,
+    *,
+    basket_share: float = 0.70,
+) -> pd.DataFrame:
+    """Keep every name in the plan: blend basket weights with dividend-yield weights."""
+    if df.empty:
+        return df
+    basket_share = max(0.0, min(1.0, basket_share))
+    yields = _dividend_yield_by_symbol()
+    out = df.copy()
+    w_b = out["idx_weight"].astype(float)
+    b_sum = float(w_b.sum())
+    if b_sum <= 0:
+        w_b = pd.Series([1.0] * len(out), index=out.index)
+        b_sum = float(len(out))
+    w_b = w_b / b_sum * 100.0
+
+    if not yields or basket_share >= 1.0 - 1e-9:
+        out["idx_weight"] = w_b
+        return out.sort_values("idx_weight", ascending=False).reset_index(drop=True)
+
+    sym = out["symbol"].astype(str).str.upper()
+    dy = sym.map(lambda s: max(float(yields.get(s, 0.0) or 0.0), 0.01))
+    d_sum = float(dy.sum())
+    w_d = dy / d_sum * 100.0 if d_sum > 0 else w_b
+
+    out["idx_weight"] = basket_share * w_b + (1.0 - basket_share) * w_d
+    return out.sort_values("idx_weight", ascending=False).reset_index(drop=True)
+
+
+def maybe_rotate_dividend_additions(
+    scoped: pd.DataFrame,
+    live_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Optionally add 2–3 high-yield basket names not yet in this top-up (monthly rotation)."""
+    ans = prompt(
+        "\nDividend tilt: rotate in 2–3 high-yield basket names you do not hold "
+        "yet (held names stay in the plan)? [Y/n]: "
+    ).lower()
+    if ans in ("n", "no"):
+        return scoped
+
+    count_raw = prompt("How many dividend names this month [3]: ").strip() or "3"
+    try:
+        count = int(count_raw)
+    except ValueError:
+        count = 3
+    count = max(1, min(5, count))
+
+    yields = _dividend_yield_by_symbol()
+    live = live_df.copy()
+    live["symbol"] = live["symbol"].astype(str).str.upper()
+    live["dividend_yield"] = live["symbol"].map(
+        lambda s: float(yields.get(s, 0.0) or 0.0)
+    )
+    ranked = live.sort_values(
+        ["dividend_yield", "idx_weight"], ascending=[False, False]
+    )
+    order = ranked["symbol"].astype(str).tolist()
+    if not order:
+        return scoped
+
+    in_scope = set(scoped["symbol"].astype(str).str.upper())
+    state = load_user_state()
+    start = int(state.get("dividend_rotation_index", 0) or 0) % len(order)
+    picks: list[str] = []
+    for i in range(len(order)):
+        sym = order[(start + i) % len(order)]
+        if sym not in in_scope:
+            picks.append(sym)
+        if len(picks) >= count:
+            break
+
+    if not picks:
+        print("  Top-yield basket names are already in this top-up.")
+        return scoped
+
+    next_idx = (start + max(1, len(picks))) % len(order)
+    save_user_state(dividend_rotation_index=str(next_idx))
+
+    extra = ranked[ranked["symbol"].isin(picks)].drop(
+        columns=["dividend_yield"], errors="ignore"
+    )
+    print(
+        "\n  Dividend rotation — adding to this top-up (does not remove held names): "
+        + ", ".join(picks)
+    )
+    return (
+        pd.concat([scoped, extra], ignore_index=True)
+        .drop_duplicates(subset=["symbol"], keep="first")
+        .sort_values("idx_weight", ascending=False)
+        .reset_index(drop=True)
+    )
 
 
 def _pe_ratio_by_symbol() -> dict[str, float]:
@@ -3205,9 +3301,7 @@ def _symbol_quality_check(
     sym = sym.upper()
     if max_pe is not None:
         pe = pe_map.get(sym)
-        if pe is None:
-            return False, f"P/E unknown (cap is {max_pe:g})"
-        if pe > max_pe + 1e-9:
+        if pe is not None and pe > max_pe + 1e-9:
             return False, f"P/E {pe:.1f} > {max_pe:g}"
     if exclude_eps_decline:
         if sym not in eps_cache:
@@ -3301,6 +3395,18 @@ def prompt_topup_quality_and_replacements(
 
     print("\n  Removed from this month's buys (you can still hold them):")
     print(dropped.to_string(index=False))
+
+    if len(scoped) >= 3 and len(kept) < max(3, (len(scoped) + 1) // 2):
+        print(
+            f"\n  Warning: only {len(kept)} name(s) left — "
+            "this month's SIP would concentrate in very few lines."
+        )
+        relax = prompt(
+            "Keep the full top-up list and skip the quality filter this month? [Y/n]: "
+        ).lower()
+        if relax not in ("n", "no"):
+            print("  Keeping all names in this top-up (no quality filter).")
+            return scoped
 
     add_ans = prompt(
         "\nAdd replacement(s) from the live basket that pass the same rules? [Y/n]: "
@@ -3438,16 +3544,28 @@ def apply_topup_allocation_tweaks(
     universe_label: str,
     topup_strategy: str,
 ) -> pd.DataFrame:
+    if topup_strategy == "dividend_tilt":
+        scoped = maybe_rotate_dividend_additions(scoped, live_df)
     scoped = prompt_optional_topup_exclusions(scoped, universe_label=universe_label)
     scoped = prompt_topup_quality_and_replacements(scoped, live_df)
     if scoped.empty:
         return scoped
     if topup_strategy == "dividend_tilt":
+        share_raw = prompt(
+            "\nDividend tilt: share of weights from basket vs yield "
+            "(0.7 = 70% basket / 30% yield) [0.7]: "
+        ).strip()
+        try:
+            basket_share = float(share_raw) if share_raw else 0.70
+        except ValueError:
+            basket_share = 0.70
+        basket_share = max(0.0, min(1.0, basket_share))
         print(
-            "\n  Dividend tilt: this month's cash follows screener dividend yield "
-            "(not ETF/index basket weights)."
+            f"\n  Dividend tilt: {basket_share * 100:.0f}% basket weights + "
+            f"{(1 - basket_share) * 100:.0f}% screener dividend yield "
+            f"— all {len(scoped)} name(s) stay in the plan."
         )
-        scoped = apply_dividend_yield_weights(scoped)
+        scoped = apply_dividend_tilt_blend(scoped, basket_share=basket_share)
         show = scoped[["symbol", "name", "idx_weight"]].copy()
         show["idx_weight"] = show["idx_weight"].map(lambda w: f"{w:.2f}%")
         print(show.to_string(index=False))
@@ -4988,8 +5106,8 @@ def choose_topup_strategy() -> str:
         "(may buy names you do not hold yet)"
     )
     print(
-        "  4. Dividend tilt — among names in this top-up, weight by screener "
-        "dividend yield (income bias vs basket weights)"
+        "  4. Dividend tilt — keep all names; blend basket + yield weights; "
+        "optional rotate 2–3 high-yield basket lines"
     )
     print()
     while True:
@@ -5366,7 +5484,7 @@ def run_topup_from_prior_shares(
         mode_label = "equal PKR per held name"
     elif topup_strategy == "dividend_tilt":
         mode_label = (
-            "held names — dividend yield weights applied after optional exclusions"
+            "held names — basket + dividend blend after optional exclusions"
         )
     else:
         mode_label = "live weights among held names only"
