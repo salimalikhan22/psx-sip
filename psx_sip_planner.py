@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -931,6 +931,7 @@ Quick reference (type h or ? at any menu):
   • Stock scanner (menu 5): filter screener (P/E, yield, …) + optional EPS / profit from PSX.
   • Top-up: 1 held weights / 2 equal / 3 benchmark gap-fill / 4 dividend tilt.
   • Top-up: optional sector/symbol exclusions (e.g. skip CEMENT this month).
+  • Top-up: portfolio mix + new-money ideas (sector, dividend) before you exclude anything.
   • Top-up: optional P/E cap + EPS quality screen — swap in other basket names.
   • Dividend-focused SIP: main menu 6 (PSXDIV20, fund blends, yield basket).
   • Snapshot load shows basket drift (new/dropped names, weight shifts).
@@ -4250,6 +4251,397 @@ def _benchmark_target_pct(live_df: pd.DataFrame) -> pd.Series:
     return s
 
 
+TOPUP_OVERWEIGHT_PP = 2.0
+TOPUP_UNDERWEIGHT_PP = 2.0
+TOPUP_LIGHTEN_MAX_PE = 12.0
+TOPUP_FAVOR_MIN_BENCH_PCT = 3.0
+
+
+def _benchmark_holdings_detail(
+    prior_shares: dict[str, int],
+    live_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, float, set[str]] | None:
+    """Value in-basket holdings; compare weights to benchmark."""
+    target = _benchmark_target_pct(live_df)
+    if target.empty:
+        return None
+
+    live = live_df.copy()
+    live["symbol"] = live["symbol"].astype(str).str.upper()
+    by_sym = live.set_index("symbol")
+    pe_map = _pe_ratio_by_symbol()
+    div_map = _dividend_yield_by_symbol()
+
+    held_rows: list[dict] = []
+    orphan_rows: list[dict] = []
+    total_value = 0.0
+
+    for sym, sh in prior_shares.items():
+        if sh <= 0:
+            continue
+        sym = sym.upper()
+        if sym not in by_sym.index:
+            orphan_rows.append({"symbol": sym, "shares": sh})
+            continue
+        row = by_sym.loc[sym]
+        price = float(row["price"])
+        value = sh * price
+        total_value += value
+        held_rows.append(
+            {
+                "symbol": sym,
+                "name": str(row.get("name", sym)),
+                "sector_name": str(row.get("sector_name", "UNKNOWN")),
+                "shares": sh,
+                "price": price,
+                "value_pkr": value,
+            }
+        )
+
+    if total_value <= 0:
+        return None
+
+    held_symbols = {r["symbol"] for r in held_rows}
+    target_pct = target * 100.0
+    held_only_total = float(target.loc[list(held_symbols)].sum()) * 100.0
+
+    detail: list[dict] = []
+    for r in held_rows:
+        sym = r["symbol"]
+        your_pct = r["value_pkr"] / total_value * 100.0
+        bench_pct = float(target_pct[sym])
+        bench_on_held = (
+            bench_pct / held_only_total * 100.0 if held_only_total > 0 else 0.0
+        )
+        pe = pe_map.get(sym)
+        detail.append(
+            {
+                **r,
+                "your_pct": your_pct,
+                "benchmark_pct": bench_pct,
+                "bench_on_held_pct": bench_on_held,
+                "weight_gap_pp": your_pct - bench_on_held,
+                "pe_ratio": pe,
+                "dividend_yield": float(div_map.get(sym, 0.0) or 0.0),
+            }
+        )
+
+    held_df = pd.DataFrame(detail).sort_values("value_pkr", ascending=False)
+    orphan_df = pd.DataFrame(orphan_rows)
+    return held_df, orphan_df, total_value, held_symbols
+
+
+def report_topup_new_money_guide(
+    prior_shares: dict[str, int],
+    live_df: pd.DataFrame,
+    source_type: str,
+    source_id: str,
+) -> tuple[set[str], set[str], bool, bool]:
+    """
+    Show diversification + dividend profile; suggest new SIP only (no sales).
+    Returns symbols to skip/add on this top-up and whether user opted in.
+    """
+    empty: tuple[set[str], set[str], bool, bool] = (set(), set(), False, False)
+    parsed = _benchmark_holdings_detail(prior_shares, live_df)
+    if parsed is None:
+        print("\n  Could not value holdings for mix report (check symbols/shares).")
+        return empty
+    held_df, orphan_df, total_value, held_symbols = parsed
+
+    print(f"\n{'=' * 72}")
+    print(f"  Your portfolio mix vs {source_type.upper()} {source_id}")
+    print(f"  (Review only — nothing is sold or removed from your holdings file.)")
+    print(f"{'=' * 72}")
+    print(
+        f"\n  Marked value (in-basket): PKR {total_value:,.2f} · "
+        f"{len(held_symbols)} / {len(live_df)} basket names held"
+    )
+
+    user_sec = (
+        held_df.groupby("sector_name", as_index=False)["value_pkr"]
+        .sum()
+        .assign(sector_pct=lambda d: d["value_pkr"] / total_value * 100.0)
+    )
+    bench_sec = sector_weight_table(live_df).rename(
+        columns={"sector_weight": "bench_sector_pct"}
+    )
+    mix = user_sec.merge(
+        bench_sec[["sector_name", "bench_sector_pct", "stocks"]],
+        on="sector_name",
+        how="outer",
+    ).fillna(0.0)
+    mix["sector_pct"] = mix["sector_pct"].fillna(0.0)
+    mix["gap_pp"] = mix["sector_pct"] - mix["bench_sector_pct"]
+    mix = mix.sort_values("sector_pct", ascending=False)
+
+    print("\n  Sector diversification (by current market value):\n")
+    sec_show = mix[
+        ["sector_name", "sector_pct", "bench_sector_pct", "gap_pp", "stocks"]
+    ].copy()
+    sec_show["sector_pct"] = sec_show["sector_pct"].map(
+        lambda v: f"{v:.1f}%" if v > 0 else "—"
+    )
+    sec_show["bench_sector_pct"] = sec_show["bench_sector_pct"].map(
+        lambda v: f"{v:.1f}%"
+    )
+    sec_show["gap_pp"] = sec_show["gap_pp"].map(lambda v: f"{v:+.1f} pp")
+    sec_show = sec_show.rename(
+        columns={
+            "sector_name": "sector",
+            "sector_pct": "your_%",
+            "bench_sector_pct": "bench_%",
+            "gap_pp": "vs_bench",
+            "stocks": "names_in_basket",
+        }
+    )
+    print(sec_show.to_string(index=False))
+
+    top3 = held_df.head(3)["your_pct"].sum()
+    top1 = float(held_df.iloc[0]["your_pct"]) if not held_df.empty else 0.0
+    n_sectors = len(user_sec)
+    print(
+        f"\n  Concentration: largest line {top1:.1f}% · top 3 lines {top3:.1f}% · "
+        f"{n_sectors} sector(s) represented"
+    )
+
+    port_div = float(
+        (held_df["value_pkr"] * held_df["dividend_yield"]).sum() / total_value
+    )
+    live = live_df.copy()
+    live["symbol"] = live["symbol"].astype(str).str.upper()
+    w = live["idx_weight"] / float(live["idx_weight"].sum())
+    live["dividend_yield"] = live["symbol"].map(
+        lambda s: float(_dividend_yield_by_symbol().get(s, 0.0) or 0.0)
+    )
+    bench_div = float((w * live["dividend_yield"]).sum())
+    print(
+        f"\n  Dividend yield (screener, value-weighted): "
+        f"your book ≈ {port_div:.2f}% · full basket ≈ {bench_div:.2f}%"
+    )
+    if port_div + 0.25 < bench_div:
+        print(
+            "  → New cash tilted toward higher-yield basket names would "
+            "move you toward the basket’s income profile."
+        )
+
+    lighten_rows: list[dict] = []
+    for _, row in held_df.iterrows():
+        reasons: list[str] = []
+        gap = float(row["weight_gap_pp"])
+        if gap >= TOPUP_OVERWEIGHT_PP:
+            reasons.append(f"overweight +{gap:.1f}pp vs held-bench")
+        pe = row.get("pe_ratio")
+        if pe is not None and pd.notna(pe) and float(pe) > TOPUP_LIGHTEN_MAX_PE:
+            reasons.append(f"P/E {float(pe):.1f} > {TOPUP_LIGHTEN_MAX_PE:g}")
+        if reasons:
+            lighten_rows.append(
+                {
+                    "symbol": row["symbol"],
+                    "name": row["name"],
+                    "your_pct": row["your_pct"],
+                    "bench_on_held_pct": row["bench_on_held_pct"],
+                    "dividend_yield": row["dividend_yield"],
+                    "pe_ratio": pe,
+                    "suggestion": "skip new buys this month",
+                    "reasons": "; ".join(reasons),
+                }
+            )
+
+    eps_check = prompt(
+        "\nCheck EPS trend on held names for new-buy suggestions? [y/N]: "
+    ).lower()
+    if eps_check in ("y", "yes"):
+        n = len(held_df)
+        print(f"  Reading annual EPS ({n} held names)…")
+        for i, (_, row) in enumerate(held_df.iterrows(), start=1):
+            sym = str(row["symbol"]).upper()
+            if i == 1 or i == n or i % 4 == 0:
+                print(f"    … {i}/{n}", flush=True)
+            note, exclude = _describe_eps_trend(_company_annual_eps_values(sym))
+            if exclude:
+                found = next(
+                    (r for r in lighten_rows if r["symbol"] == sym), None
+                )
+                if found:
+                    found["reasons"] += f"; {note}"
+                else:
+                    lighten_rows.append(
+                        {
+                            "symbol": sym,
+                            "name": row["name"],
+                            "your_pct": row["your_pct"],
+                            "bench_on_held_pct": row["bench_on_held_pct"],
+                            "dividend_yield": row["dividend_yield"],
+                            "pe_ratio": row.get("pe_ratio"),
+                            "suggestion": "skip new buys this month",
+                            "reasons": note,
+                        }
+                    )
+
+    skip_symbols = {str(r["symbol"]).upper() for r in lighten_rows}
+
+    print("\n  --- New SIP: deprioritize (you still hold; skip only this month) ---")
+    if lighten_rows:
+        ld = pd.DataFrame(lighten_rows).sort_values("your_pct", ascending=False)
+        show = ld[
+            [
+                "symbol",
+                "your_pct",
+                "bench_on_held_pct",
+                "dividend_yield",
+                "pe_ratio",
+                "reasons",
+            ]
+        ].copy()
+        show["your_pct"] = show["your_pct"].map(lambda v: f"{v:.1f}%")
+        show["bench_on_held_pct"] = show["bench_on_held_pct"].map(
+            lambda v: f"{v:.1f}%"
+        )
+        show["dividend_yield"] = show["dividend_yield"].map(
+            lambda v: f"{v:.2f}%"
+        )
+        show["pe_ratio"] = show["pe_ratio"].map(
+            lambda v: f"{v:.1f}" if v is not None and pd.notna(v) else "—"
+        )
+        print(show.to_string(index=False))
+    else:
+        print("  None flagged (overweight / P/E / EPS rules).")
+
+    favor_rows: list[dict] = []
+    live_syms = set(live["symbol"].astype(str).str.upper())
+    missing = live[~live["symbol"].isin(held_symbols)].copy()
+    for _, row in missing.iterrows():
+        sym = str(row["symbol"]).upper()
+        bw = float(row["idx_weight"])
+        dy = float(_dividend_yield_by_symbol().get(sym, 0.0) or 0.0)
+        if bw < TOPUP_FAVOR_MIN_BENCH_PCT and dy < max(bench_div, 3.0):
+            continue
+        favor_rows.append(
+            {
+                "symbol": sym,
+                "name": row.get("name", sym),
+                "benchmark_pct": bw,
+                "dividend_yield": dy,
+                "suggestion": "add with new cash",
+                "reasons": f"not held; basket {bw:.1f}%",
+            }
+        )
+    favor_rows.sort(
+        key=lambda r: (r["dividend_yield"], r["benchmark_pct"]), reverse=True
+    )
+
+    for _, row in held_df.iterrows():
+        gap = float(row["weight_gap_pp"])
+        if gap <= -TOPUP_UNDERWEIGHT_PP:
+            sym = str(row["symbol"]).upper()
+            favor_rows.append(
+                {
+                    "symbol": sym,
+                    "name": row["name"],
+                    "benchmark_pct": float(row["benchmark_pct"]),
+                    "dividend_yield": float(row["dividend_yield"]),
+                    "suggestion": "add more (underweight)",
+                    "reasons": f"underweight {gap:.1f}pp vs held-bench",
+                }
+            )
+
+    print("\n  --- New SIP: favor (same rules — buys only) ---")
+    if favor_rows:
+        fd = pd.DataFrame(favor_rows).drop_duplicates(subset=["symbol"], keep="first")
+        fd = fd.sort_values(
+            ["dividend_yield", "benchmark_pct"], ascending=[False, False]
+        )
+        show = fd.head(12)[
+            [
+                "symbol",
+                "name",
+                "benchmark_pct",
+                "dividend_yield",
+                "suggestion",
+                "reasons",
+            ]
+        ].copy()
+        show["benchmark_pct"] = show["benchmark_pct"].map(lambda v: f"{v:.1f}%")
+        show["dividend_yield"] = show["dividend_yield"].map(
+            lambda v: f"{v:.2f}%"
+        )
+        print(show.to_string(index=False))
+    else:
+        print("  No basket names stand out — try benchmark gap-fill (strategy 3).")
+
+    add_symbols = set()
+    if favor_rows:
+        fd = pd.DataFrame(favor_rows).drop_duplicates(subset=["symbol"], keep="first")
+        fd = fd.sort_values(
+            ["dividend_yield", "benchmark_pct"], ascending=[False, False]
+        )
+        for sym in fd.head(5)["symbol"].astype(str).str.upper():
+            if sym not in held_symbols:
+                add_symbols.add(sym)
+
+    apply_skip = False
+    apply_add = False
+    if skip_symbols:
+        apply_skip = prompt(
+            "\nApply deprioritize list to THIS top-up (skip new buys in those symbols)? [y/N]: "
+        ).lower() in ("y", "yes")
+    if add_symbols:
+        apply_add = prompt(
+            "Add top suggested basket name(s) you do not hold yet to THIS top-up? [y/N]: "
+        ).lower() in ("y", "yes")
+
+    if orphan_df is not None and not orphan_df.empty:
+        print("\n  Symbols in your file but not in the live basket:")
+        for _, r in orphan_df.iterrows():
+            print(f"    {r['symbol']}: {int(r['shares'])} shares")
+
+    print(
+        "\n  Next: pick top-up strategy (4 = dividend tilt), then optional "
+        "sector exclusions / quality filter."
+    )
+    return skip_symbols, add_symbols, apply_skip, apply_add
+
+
+def apply_new_money_hint_selection(
+    scoped: pd.DataFrame,
+    live_df: pd.DataFrame,
+    skip_symbols: set[str],
+    add_symbols: set[str],
+    apply_skip: bool,
+    apply_add: bool,
+) -> pd.DataFrame:
+    if scoped.empty:
+        return scoped
+    out = scoped.copy()
+    out["symbol"] = out["symbol"].astype(str).str.upper()
+    if apply_skip and skip_symbols:
+        before = len(out)
+        out = out[~out["symbol"].isin(skip_symbols)].copy()
+        removed = before - len(out)
+        if removed:
+            print(
+                f"\n  Applied mix guide: skipped new buys in "
+                f"{', '.join(sorted(skip_symbols & set(scoped['symbol'].astype(str).str.upper())))}."
+            )
+    if apply_add and add_symbols:
+        live = live_df.copy()
+        live["symbol"] = live["symbol"].astype(str).str.upper()
+        have = set(out["symbol"].astype(str))
+        extra = live[live["symbol"].isin(add_symbols - have)]
+        if not extra.empty:
+            out = (
+                pd.concat([out, extra], ignore_index=True)
+                .drop_duplicates(subset=["symbol"], keep="first")
+                .sort_values("idx_weight", ascending=False)
+                .reset_index(drop=True)
+            )
+            print(
+                "  Applied mix guide: added to this top-up: "
+                + ", ".join(extra["symbol"].astype(str).tolist())
+            )
+    return out.reset_index(drop=True)
+
+
 def report_holdings_alignment(
     prior_shares: dict[str, int],
     live_df: pd.DataFrame,
@@ -4437,6 +4829,9 @@ def run_holdings_align_flow() -> None:
     if ans not in ("y", "yes"):
         return
 
+    skip_syms, add_syms, apply_skip, apply_add = report_topup_new_money_guide(
+        prior, live_df, source_type, source_id
+    )
     topup_strategy = choose_topup_strategy()
     scoped, prior = run_topup_from_prior_shares(
         prior,
@@ -4449,6 +4844,17 @@ def run_holdings_align_flow() -> None:
     )
     if scoped.empty:
         print("  No symbols to allocate; cannot top-up.")
+        return
+    scoped = apply_new_money_hint_selection(
+        scoped,
+        live_df,
+        skip_syms,
+        add_syms,
+        apply_skip,
+        apply_add,
+    )
+    if scoped.empty:
+        print("  No symbols left after mix guide.")
         return
     scoped = apply_topup_allocation_tweaks(
         scoped,
@@ -4984,6 +5390,9 @@ def run_topup_flow(
     prior, snap_header, snap_df = choose_topup_holdings_source(
         default_snapshot, source_type, source_id
     )
+    skip_syms, add_syms, apply_skip, apply_add = report_topup_new_money_guide(
+        prior, live_df, source_type, source_id
+    )
     topup_strategy = choose_topup_strategy()
     scoped, prior = run_topup_from_prior_shares(
         prior,
@@ -4993,6 +5402,14 @@ def run_topup_flow(
         topup_strategy=topup_strategy,
         snapshot_df=snap_df,
         snapshot_header=snap_header,
+    )
+    scoped = apply_new_money_hint_selection(
+        scoped,
+        live_df,
+        skip_syms,
+        add_syms,
+        apply_skip,
+        apply_add,
     )
     label = "ETF basket" if source_type == "etf" else universe_label_from_source(source_type, source_id)
     scoped = apply_topup_allocation_tweaks(
