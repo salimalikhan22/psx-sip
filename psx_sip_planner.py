@@ -5110,6 +5110,9 @@ def _run_benchmark_sip_flow(
         scoped, prior_shares, topup_strategy = run_topup_flow(
             df, source_type, source_id, default_path
         )
+        if scoped.empty:
+            print("  No symbols left for this top-up after adjustments.")
+            return
     else:
         exclude_sectors, exclude_symbols = prompt_exclusions(
             df, universe_label=universe_label
