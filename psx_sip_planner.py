@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -4896,7 +4896,7 @@ def report_basket_drift(
             snap["idx_weight_pct"], errors="coerce"
         )
     else:
-        snap["saved_weight"] = pd.nan
+        snap["saved_weight"] = float("nan")
 
     live = live_df.copy()
     live["symbol"] = live["symbol"].astype(str).str.upper()
