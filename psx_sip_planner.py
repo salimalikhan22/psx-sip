@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.3.6"
+__version__ = "1.3.7"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -935,7 +935,7 @@ Quick reference (type h or ? at any menu):
   • Top-up: 1 held weights / 2 equal / 3 gap-fill / 4 dividend tilt (blend + optional rotate 2–3 names).
   • Top-up: optional sector/symbol exclusions (e.g. skip CEMENT this month).
   • Top-up: portfolio mix + new-money ideas (sector, dividend) before you exclude anything.
-  • Top-up: optional P/E cap + EPS screen (known P/E only; unknown passes) — or skip filter and use mix-guide deprioritize.
+  • Top-up buy filter: dividend-first (keep regular DPS) or strict P/E+EPS — or N after DPS table / mix deprioritize.
   • Top-up mix guide: EPS + DPS (Yahoo cash amounts when available; PSX dividend notices via dps.psx.com.pk as fallback).
   • Dividend-focused SIP: main menu 6 (PSXDIV20, fund blends, yield basket).
   • Snapshot load shows basket drift (new/dropped names, weight shifts).
@@ -3767,6 +3767,21 @@ def _pe_ratio_by_symbol() -> dict[str, float]:
     return out
 
 
+def _is_regular_dps_payer(sym: str) -> tuple[bool, str]:
+    """True when 5y DPS history looks like a regular cash payer (not irregular / none)."""
+    hist = _dps_history(sym)
+    note, irregular = _describe_dps_regularity(hist)
+    years = int(hist.get("years_with_dividends") or 0)
+    lb = int(hist.get("lookback_years") or _DPS_LOOKBACK_YEARS)
+    if irregular or years == 0:
+        return False, note
+    if years >= lb - 1:
+        return True, note
+    if years >= max(2, lb // 2):
+        return True, note
+    return False, note
+
+
 def _symbol_quality_check(
     sym: str,
     *,
@@ -3774,7 +3789,12 @@ def _symbol_quality_check(
     exclude_eps_decline: bool,
     pe_map: dict[str, float],
     eps_cache: dict[str, tuple[str, bool]],
+    protect_regular_dps: bool = False,
 ) -> tuple[bool, str]:
+    if protect_regular_dps:
+        ok_dps, dnote = _is_regular_dps_payer(sym)
+        if ok_dps:
+            return True, f"regular DPS ({dnote})"
     sym = sym.upper()
     if max_pe is not None:
         pe = pe_map.get(sym)
@@ -3794,6 +3814,7 @@ def _quality_filter_dataframe(
     *,
     max_pe: float | None,
     exclude_eps_decline: bool,
+    protect_regular_dps: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Return (kept rows, dropped rows with quality_reason)."""
     if df.empty:
@@ -3803,11 +3824,13 @@ def _quality_filter_dataframe(
     kept_rows: list[pd.Series] = []
     dropped: list[dict] = []
     n = len(df)
-    if exclude_eps_decline and n > 0:
+    if exclude_eps_decline and n > 0 and not protect_regular_dps:
         print(f"  Checking annual EPS on PSX company pages ({n} name(s)…)…")
+    elif protect_regular_dps and n > 0:
+        print(f"  Dividend-first filter on {n} name(s) (regular DPS payers kept)…")
     for i, (_, row) in enumerate(df.iterrows(), start=1):
         sym = str(row["symbol"]).upper()
-        if exclude_eps_decline and (i == 1 or i == n or i % 5 == 0):
+        if exclude_eps_decline and not protect_regular_dps and (i == 1 or i == n or i % 5 == 0):
             print(f"    … {i}/{n}", flush=True)
         ok, reason = _symbol_quality_check(
             sym,
@@ -3815,6 +3838,7 @@ def _quality_filter_dataframe(
             exclude_eps_decline=exclude_eps_decline,
             pe_map=pe_map,
             eps_cache=eps_cache,
+            protect_regular_dps=protect_regular_dps,
         )
         if ok:
             kept_rows.append(row)
@@ -3840,31 +3864,48 @@ def prompt_topup_quality_and_replacements(
 ) -> pd.DataFrame:
     """Drop names failing P/E or EPS rules; optionally add other benchmark lines."""
     ans = prompt(
-        "\nSkip names with weak fundamentals on this top-up "
-        "(P/E cap and/or EPS trend)? [y/N]: "
+        "\nApply a buy filter this month? [y/N] "
+        "(tip: after DPS table, use 1 dividend-first or N — strict P/E removes FFC/MEBL/LUCK): "
     ).lower()
     if ans not in ("y", "yes"):
         return scoped
 
-    max_pe_raw = prompt("Maximum P/E (Enter=12, type none for no cap) [12]: ").strip()
-    if max_pe_raw == "":
-        max_pe: float | None = 12.0
-    elif max_pe_raw.lower() in ("none", "no", "skip", "-", "*"):
-        max_pe = None
-    else:
-        try:
-            max_pe = float(max_pe_raw.replace(",", ""))
-        except ValueError:
-            print("  Invalid P/E — using 12.")
-            max_pe = 12.0
+    style = prompt(
+        "  1. Dividend-first — drop irregular/no DPS only; keep regular payers (recommended)\n"
+        "  2. Strict — P/E cap + optional EPS (can remove good dividend names)\n"
+        "Select [1]: "
+    ).strip() or "1"
+    dividend_first = style not in ("2", "strict", "pe", "eps")
 
-    eps_ans = prompt("Skip EPS down 2+ years in a row? [Y/n]: ").lower()
-    exclude_eps = eps_ans not in ("n", "no")
+    if dividend_first:
+        max_pe = None
+        exclude_eps = False
+        print(
+            "  Dividend-first: skipping only irregular / no-DPS names; "
+            "regular payers stay even if P/E or EPS look weak."
+        )
+    else:
+        max_pe_raw = prompt(
+            "Maximum P/E (Enter=12, type none for no cap) [12]: "
+        ).strip()
+        if max_pe_raw == "":
+            max_pe = 12.0
+        elif max_pe_raw.lower() in ("none", "no", "skip", "-", "*"):
+            max_pe = None
+        else:
+            try:
+                max_pe = float(max_pe_raw.replace(",", ""))
+            except ValueError:
+                print("  Invalid P/E — using 12.")
+                max_pe = 12.0
+        eps_ans = prompt("Skip EPS down 2+ years in a row? [Y/n]: ").lower()
+        exclude_eps = eps_ans not in ("n", "no")
 
     kept, dropped = _quality_filter_dataframe(
         scoped,
         max_pe=max_pe,
         exclude_eps_decline=exclude_eps,
+        protect_regular_dps=dividend_first,
     )
     if dropped.empty:
         print("  All names in this top-up pass the quality rules.")
@@ -3885,9 +3926,15 @@ def prompt_topup_quality_and_replacements(
             print("  Keeping all names in this top-up (no quality filter).")
             return scoped
 
-    add_ans = prompt(
-        "\nAdd replacement(s) from the live basket that pass the same rules? [Y/n]: "
-    ).lower()
+    add_prompt = (
+        "\nAdd replacement(s) from the basket (dividend-first picks by DPS)? [Y/n]: "
+        if dividend_first
+        else "\nAdd replacement(s) from the live basket that pass the same rules? [Y/n]: "
+    )
+    add_ans = prompt(add_prompt).lower()
+    if add_ans and add_ans not in ("y", "yes", "n", "no"):
+        print("  (Unrecognized answer — treating as Yes for replacements.)")
+        add_ans = "y"
     if add_ans in ("n", "no"):
         if kept.empty:
             print("  Nothing left to allocate — keeping original list.")
@@ -3918,6 +3965,7 @@ def prompt_topup_quality_and_replacements(
             exclude_eps_decline=exclude_eps,
             pe_map=pe_map,
             eps_cache=eps_cache,
+            protect_regular_dps=dividend_first,
         )
         if ok:
             good_rows.append(row)
@@ -3927,9 +3975,12 @@ def prompt_topup_quality_and_replacements(
         return kept if not kept.empty else scoped
 
     yields = _dividend_yield_by_symbol()
-    pref = prompt(
-        "Pick replacements by [1] dividend yield  [2] basket weight [1]: "
-    ).strip() or "1"
+    if dividend_first:
+        pref = "1"
+    else:
+        pref = prompt(
+            "Pick replacements by [1] dividend yield  [2] basket weight [1]: "
+        ).strip() or "1"
     if pref in ("2", "weight", "basket", "w"):
         candidates = candidates.sort_values("idx_weight", ascending=False)
     else:
