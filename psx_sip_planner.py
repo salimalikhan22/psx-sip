@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.3.4"
+__version__ = "1.3.5"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -72,6 +72,9 @@ import json
 import logging
 import math
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -933,6 +936,7 @@ Quick reference (type h or ? at any menu):
   • Top-up: optional sector/symbol exclusions (e.g. skip CEMENT this month).
   • Top-up: portfolio mix + new-money ideas (sector, dividend) before you exclude anything.
   • Top-up: optional P/E cap + EPS screen (known P/E only; unknown passes) — or skip filter and use mix-guide deprioritize.
+  • Top-up mix guide: optional EPS + DPS (5y cash dividend history via Yahoo .KA; set PSX_SIP_NO_YAHOO=1 to disable).
   • Dividend-focused SIP: main menu 6 (PSXDIV20, fund blends, yield basket).
   • Snapshot load shows basket drift (new/dropped names, weight shifts).
   • Match check (menu 4): Index or ETF → CSV or SYMBOL:qty → resemblance %.
@@ -1645,6 +1649,197 @@ def _company_financials(symbol: str) -> dict[str, list[float]]:
 
 def _company_annual_eps_values(symbol: str) -> list[float]:
     return _company_financials(symbol).get("eps") or []
+
+
+_DPS_LOOKBACK_YEARS = 5
+_dividend_history_cache: dict[str, dict] = {}
+_YAHOO_UA = "Mozilla/5.0 (compatible; psx-sip-planner/1.0)"
+
+
+def _yahoo_dividends_enabled() -> bool:
+    return os.environ.get("PSX_SIP_NO_YAHOO", "").strip().lower() not in (
+        "1",
+        "yes",
+        "true",
+    )
+
+
+def _yahoo_chart_symbol(symbol: str) -> str:
+    return f"{symbol.upper()}.KA"
+
+
+def _fetch_yahoo_dividend_payments(
+    symbol: str,
+) -> list[tuple[datetime, float]]:
+    """Cash dividend payments (PKR per share) from Yahoo chart events."""
+    sym = _yahoo_chart_symbol(symbol)
+    params = urllib.parse.urlencode(
+        {"interval": "1d", "range": "5y", "events": "div"}
+    )
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(sym)}?{params}"
+    req = urllib.request.Request(url, headers={"User-Agent": _YAHOO_UA})
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        payload = json.loads(resp.read().decode())
+    block = (payload.get("chart") or {}).get("result")
+    if not block:
+        return []
+    events = (block[0].get("events") or {}).get("dividends") or {}
+    out: list[tuple[datetime, float]] = []
+    for item in events.values():
+        ts = item.get("date")
+        amt = item.get("amount")
+        if ts is None or amt is None:
+            continue
+        try:
+            dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+            out.append((dt, float(amt)))
+        except (TypeError, ValueError, OSError):
+            continue
+    out.sort(key=lambda p: p[0], reverse=True)
+    return out
+
+
+def _summarize_dps_payments(
+    payments: list[tuple[datetime, float]],
+    *,
+    lookback_years: int = _DPS_LOOKBACK_YEARS,
+) -> dict:
+    now = datetime.now(timezone.utc)
+    current_year = now.year
+    start_year = current_year - lookback_years + 1
+    by_year: dict[int, list[float]] = {}
+    for dt, amt in payments:
+        y = dt.year
+        if y < start_year or y > current_year:
+            continue
+        by_year.setdefault(y, []).append(amt)
+    years_sorted = sorted(by_year.keys(), reverse=True)
+    annual_totals = {y: float(sum(by_year[y])) for y in years_sorted}
+    last_calendar = annual_totals.get(current_year - 1)
+    if last_calendar is None and years_sorted:
+        last_calendar = annual_totals.get(years_sorted[0])
+    return {
+        "lookback_years": lookback_years,
+        "years_with_dividends": len(by_year),
+        "annual_totals_by_year": annual_totals,
+        "annual_dps_newest_first": [annual_totals[y] for y in years_sorted],
+        "payments_count": sum(len(v) for v in by_year.values()),
+        "last_fiscal_total": last_calendar,
+        "source": "yahoo",
+    }
+
+
+def _implied_dps_from_screener(symbol: str) -> float | None:
+    row = _screener_row(symbol)
+    if row is None:
+        return None
+    price = pd.to_numeric(row.get("price"), errors="coerce")
+    dy = pd.to_numeric(row.get("dividend_yield"), errors="coerce")
+    if pd.isna(price) or pd.isna(dy) or float(price) <= 0:
+        return None
+    return float(price) * float(dy) / 100.0
+
+
+def _screener_row(symbol: str) -> pd.Series | None:
+    scr = _build_screener_enriched()
+    if scr.empty:
+        return None
+    sym = symbol.upper()
+    hit = scr[scr["symbol"].astype(str).str.upper() == sym]
+    if hit.empty:
+        return None
+    return hit.iloc[0]
+
+
+def _dps_history(symbol: str) -> dict:
+    sym = symbol.upper()
+    if sym in _dividend_history_cache:
+        return _dividend_history_cache[sym]
+    summary: dict = {
+        "lookback_years": _DPS_LOOKBACK_YEARS,
+        "years_with_dividends": 0,
+        "annual_dps_newest_first": [],
+        "annual_totals_by_year": {},
+        "last_fiscal_total": None,
+        "source": "none",
+        "implied_dps": None,
+    }
+    if _yahoo_dividends_enabled():
+        try:
+            payments = _fetch_yahoo_dividend_payments(sym)
+            if payments:
+                summary = _summarize_dps_payments(payments)
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, KeyError, ValueError):
+            pass
+    if summary.get("years_with_dividends", 0) == 0:
+        implied = _implied_dps_from_screener(sym)
+        if implied is not None and implied > 0:
+            summary["implied_dps"] = implied
+            summary["source"] = "screener_implied"
+    _dividend_history_cache[sym] = summary
+    return summary
+
+
+def _describe_dps_regularity(summary: dict) -> tuple[str, bool]:
+    """
+    Label for display; second value True = weak / irregular payer (income screen).
+    """
+    lb = int(summary.get("lookback_years") or _DPS_LOOKBACK_YEARS)
+    y = int(summary.get("years_with_dividends") or 0)
+    last = summary.get("last_fiscal_total")
+    last_s = f" · FY DPS Rs {float(last):.2f}" if last is not None else ""
+    if summary.get("source") == "screener_implied":
+        imp = summary.get("implied_dps")
+        if imp:
+            return (f"DPS ~Rs {float(imp):.2f}/sh (yield×price; no history)", False)
+        return ("DPS n/a", True)
+    if y == 0:
+        return ("DPS no 5y payments", True)
+    if y >= lb - 1:
+        return (f"DPS regular {y}/{lb} yrs{last_s}", False)
+    if y >= max(2, lb // 2):
+        return (f"DPS mixed {y}/{lb} yrs{last_s}", False)
+    return (f"DPS irregular {y}/{lb} yrs{last_s}", True)
+
+
+def _print_dps_consistency_table(symbols: list[str]) -> dict[str, tuple[str, bool]]:
+    """Fetch DPS history and print a summary table; return symbol -> (note, irregular)."""
+    notes: dict[str, tuple[str, bool]] = {}
+    if not symbols:
+        return notes
+    src = "Yahoo 5y cash dividends (.KA)" if _yahoo_dividends_enabled() else "PSX screener implied only"
+    print(f"\n  Cash dividend / DPS check ({src}):\n")
+    rows: list[dict] = []
+    n = len(symbols)
+    for i, sym in enumerate(symbols, start=1):
+        sym = sym.upper()
+        if i == 1 or i == n or i % 4 == 0:
+            print(f"    … DPS {i}/{n}", flush=True)
+        hist = _dps_history(sym)
+        note, irregular = _describe_dps_regularity(hist)
+        notes[sym] = (note, irregular)
+        totals = hist.get("annual_totals_by_year") or {}
+        years = sorted(totals.keys(), reverse=True)
+        y1 = f"{totals[years[0]]:.2f}" if years else "—"
+        y2 = f"{totals[years[1]]:.2f}" if len(years) > 1 else "—"
+        rows.append(
+            {
+                "symbol": sym,
+                "years_paid": f"{hist.get('years_with_dividends', 0)}/{hist.get('lookback_years', 5)}",
+                "fy_dps_latest": y1,
+                "fy_dps_prior": y2,
+                "dps_status": note,
+            }
+        )
+    show = pd.DataFrame(rows)
+    print(show.to_string(index=False))
+    print(
+        "\n  Regular payer heuristic: cash dividends in at least "
+        f"{_DPS_LOOKBACK_YEARS - 1} of last {_DPS_LOOKBACK_YEARS} calendar years."
+    )
+    if not _yahoo_dividends_enabled():
+        print("  (PSX_SIP_NO_YAHOO=1 — enable Yahoo for full payment history.)")
+    return notes
 
 
 def _yoy_pct(values: list[float]) -> float | None:
@@ -2793,9 +2988,18 @@ def _enrich_scanner_with_company_pages(df: pd.DataFrame) -> pd.DataFrame:
         work = df.copy()
         print(f"  Enriching {len(work)} row(s) with PSX company pages…")
 
+    dps_ans = prompt(
+        "  Include DPS / 5y dividend payment history (Yahoo .KA)? [Y/n]: "
+    ).lower()
+    with_dps = dps_ans not in ("n", "no") and _yahoo_dividends_enabled()
+    if dps_ans not in ("n", "no") and not _yahoo_dividends_enabled():
+        print("  PSX_SIP_NO_YAHOO=1 — skipping DPS history.")
+
     eps_latest: list[float | None] = []
     eps_notes: list[str] = []
     profit_yoy: list[float | None] = []
+    dps_notes: list[str] = []
+    fy_dps: list[float | None] = []
     for i, sym in enumerate(work["symbol"].astype(str).str.upper(), start=1):
         if i == 1 or i == len(work) or i % 10 == 0:
             print(f"    … {i}/{len(work)}", flush=True)
@@ -2806,17 +3010,28 @@ def _enrich_scanner_with_company_pages(df: pd.DataFrame) -> pd.DataFrame:
         note, _ex = _describe_eps_trend(eps)
         eps_notes.append(note)
         profit_yoy.append(_yoy_pct(pat))
+        if with_dps:
+            hist = _dps_history(sym)
+            dnote, _irr = _describe_dps_regularity(hist)
+            dps_notes.append(dnote)
+            fy_dps.append(hist.get("last_fiscal_total"))
+        else:
+            dps_notes.append("")
+            fy_dps.append(None)
 
     work["eps_latest"] = eps_latest
     work["eps_trend"] = eps_notes
     work["profit_yoy_pct"] = profit_yoy
+    if with_dps:
+        work["dps_status"] = dps_notes
+        work["fy_dps_total"] = fy_dps
     return work
 
 
 def run_stock_scanner_flow() -> None:
     print(
-        "\nStock scanner — filter PSX screener, optionally pull EPS / profit from "
-        "company pages.\n"
+        "\nStock scanner — filter PSX screener, optionally pull EPS / DPS / profit "
+        "from PSX + Yahoo.\n"
         "  Research tool only; not investment advice."
     )
     print("\nFetching screener…")
@@ -2886,6 +3101,8 @@ def run_stock_scanner_flow() -> None:
     ]
     if "eps_latest" in view.columns:
         cols.extend(["eps_latest", "eps_trend", "profit_yoy_pct"])
+    if "fy_dps_total" in view.columns:
+        cols.extend(["fy_dps_total", "dps_status"])
     show = view[[c for c in cols if c in view.columns]].copy()
     if "price" in show.columns:
         show["price"] = show["price"].map(lambda p: f"{p:,.2f}" if pd.notna(p) else "")
@@ -4565,16 +4782,17 @@ def report_topup_new_money_guide(
                 }
             )
 
-    eps_check = prompt(
-        "\nCheck EPS trend on held names for new-buy suggestions? [y/N]: "
+    fund_check = prompt(
+        "\nCheck EPS (PSX) + DPS dividend history on held names? [y/N]: "
     ).lower()
-    if eps_check in ("y", "yes"):
+    dps_notes: dict[str, tuple[str, bool]] = {}
+    if fund_check in ("y", "yes"):
         n = len(held_df)
         print(f"  Reading annual EPS ({n} held names)…")
         for i, (_, row) in enumerate(held_df.iterrows(), start=1):
             sym = str(row["symbol"]).upper()
             if i == 1 or i == n or i % 4 == 0:
-                print(f"    … {i}/{n}", flush=True)
+                print(f"    … EPS {i}/{n}", flush=True)
             note, exclude = _describe_eps_trend(_company_annual_eps_values(sym))
             if exclude:
                 found = next(
@@ -4593,6 +4811,38 @@ def report_topup_new_money_guide(
                             "pe_ratio": row.get("pe_ratio"),
                             "suggestion": "skip new buys this month",
                             "reasons": note,
+                        }
+                    )
+        held_syms = [str(s).upper() for s in held_df["symbol"].astype(str)]
+        dps_notes = _print_dps_consistency_table(held_syms)
+        skip_irregular = prompt(
+            "\nSkip new buys this month for irregular / no DPS history names? [y/N]: "
+        ).lower() in ("y", "yes")
+        if skip_irregular:
+            for sym, (_note, irregular) in dps_notes.items():
+                if not irregular:
+                    continue
+                row = held_df[held_df["symbol"].astype(str).str.upper() == sym]
+                if row.empty:
+                    continue
+                r0 = row.iloc[0]
+                dps_note = _describe_dps_regularity(_dps_history(sym))[0]
+                found = next(
+                    (r for r in lighten_rows if r["symbol"] == sym), None
+                )
+                if found:
+                    found["reasons"] += f"; {dps_note}"
+                else:
+                    lighten_rows.append(
+                        {
+                            "symbol": sym,
+                            "name": r0["name"],
+                            "your_pct": r0["your_pct"],
+                            "bench_on_held_pct": r0["bench_on_held_pct"],
+                            "dividend_yield": r0["dividend_yield"],
+                            "pe_ratio": r0.get("pe_ratio"),
+                            "suggestion": "skip new buys this month",
+                            "reasons": dps_note,
                         }
                     )
 
@@ -4634,6 +4884,9 @@ def report_topup_new_money_guide(
         dy = float(_dividend_yield_by_symbol().get(sym, 0.0) or 0.0)
         if bw < TOPUP_FAVOR_MIN_BENCH_PCT and dy < max(bench_div, 3.0):
             continue
+        dps_note = ""
+        if fund_check in ("y", "yes"):
+            dps_note = _describe_dps_regularity(_dps_history(sym))[0]
         favor_rows.append(
             {
                 "symbol": sym,
@@ -4641,7 +4894,8 @@ def report_topup_new_money_guide(
                 "benchmark_pct": bw,
                 "dividend_yield": dy,
                 "suggestion": "add with new cash",
-                "reasons": f"not held; basket {bw:.1f}%",
+                "reasons": f"not held; basket {bw:.1f}%"
+                + (f"; {dps_note}" if dps_note else ""),
             }
         )
     favor_rows.sort(
