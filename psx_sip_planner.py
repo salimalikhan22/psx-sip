@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.3.5"
+__version__ = "1.3.6"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -936,7 +936,7 @@ Quick reference (type h or ? at any menu):
   • Top-up: optional sector/symbol exclusions (e.g. skip CEMENT this month).
   • Top-up: portfolio mix + new-money ideas (sector, dividend) before you exclude anything.
   • Top-up: optional P/E cap + EPS screen (known P/E only; unknown passes) — or skip filter and use mix-guide deprioritize.
-  • Top-up mix guide: optional EPS + DPS (5y cash dividend history via Yahoo .KA; set PSX_SIP_NO_YAHOO=1 to disable).
+  • Top-up mix guide: EPS + DPS (Yahoo cash amounts when available; PSX dividend notices via dps.psx.com.pk as fallback).
   • Dividend-focused SIP: main menu 6 (PSXDIV20, fund blends, yield basket).
   • Snapshot load shows basket drift (new/dropped names, weight shifts).
   • Match check (menu 4): Index or ETF → CSV or SYMBOL:qty → resemblance %.
@@ -1672,31 +1672,245 @@ def _fetch_yahoo_dividend_payments(
     symbol: str,
 ) -> list[tuple[datetime, float]]:
     """Cash dividend payments (PKR per share) from Yahoo chart events."""
-    sym = _yahoo_chart_symbol(symbol)
-    params = urllib.parse.urlencode(
-        {"interval": "1d", "range": "5y", "events": "div"}
-    )
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(sym)}?{params}"
-    req = urllib.request.Request(url, headers={"User-Agent": _YAHOO_UA})
-    with urllib.request.urlopen(req, timeout=25) as resp:
-        payload = json.loads(resp.read().decode())
-    block = (payload.get("chart") or {}).get("result")
-    if not block:
-        return []
-    events = (block[0].get("events") or {}).get("dividends") or {}
-    out: list[tuple[datetime, float]] = []
-    for item in events.values():
-        ts = item.get("date")
-        amt = item.get("amount")
-        if ts is None or amt is None:
+    base = symbol.upper()
+    tickers = [_yahoo_chart_symbol(base), base]
+    seen_tickers: set[str] = set()
+    for sym in tickers:
+        if sym in seen_tickers:
             continue
+        seen_tickers.add(sym)
+        params = urllib.parse.urlencode(
+            {"interval": "1d", "range": "5y", "events": "div"}
+        )
+        url = (
+            "https://query1.finance.yahoo.com/v8/finance/chart/"
+            f"{urllib.parse.quote(sym)}?{params}"
+        )
         try:
-            dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-            out.append((dt, float(amt)))
-        except (TypeError, ValueError, OSError):
+            req = urllib.request.Request(url, headers={"User-Agent": _YAHOO_UA})
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                payload = json.loads(resp.read().decode())
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
             continue
+        block = (payload.get("chart") or {}).get("result")
+        if not block:
+            continue
+        events = (block[0].get("events") or {}).get("dividends") or {}
+        out: list[tuple[datetime, float]] = []
+        for item in events.values():
+            ts = item.get("date")
+            amt = item.get("amount")
+            if ts is None or amt is None:
+                continue
+            try:
+                dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+                out.append((dt, float(amt)))
+            except (TypeError, ValueError, OSError):
+                continue
+        if out:
+            out.sort(key=lambda p: p[0], reverse=True)
+            return out
+    return []
+
+
+def _psx_dividends_enabled() -> bool:
+    return os.environ.get("PSX_SIP_NO_PSX_DIV", "").strip().lower() not in (
+        "1",
+        "yes",
+        "true",
+    )
+
+
+def _parse_psx_announcement_date(raw: str) -> datetime | None:
+    raw = raw.strip()
+    for fmt in ("%b %d, %Y", "%B %d, %Y"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_dps_amount_from_notice(title: str) -> float | None:
+    t = title.replace(",", "")
+    m = re.search(
+        r"(?:rs\.?|pkr)\s*([0-9]+(?:\.[0-9]+)?)\s*(?:/-|per\s*share|/share)?",
+        t,
+        re.I,
+    )
+    if m:
+        return float(m.group(1))
+    return None
+
+
+def _is_psx_dividend_payment_notice(title: str) -> bool:
+    t = title.lower()
+    if any(
+        needle in t
+        for needle in (
+            "newspaper",
+            "dispatch of",
+            "dispatch ",
+            "book closure",
+            "notice of book",
+            "publication of notice",
+            "unclaimed",
+            "entitlement of",
+        )
+    ):
+        return False
+    if "credit of" in t and "dividend" in t:
+        return True
+    if re.search(
+        r"\b(final|interim|first|second|third)\b.*\b(cash\s+)?dividend\b", t
+    ):
+        return True
+    if re.search(r"\binterim dividend 20[0-9]{2}\b", t):
+        return True
+    return False
+
+
+def _fetch_psx_dividend_notices(
+    symbol: str,
+    *,
+    max_offset: int = 400,
+) -> list[tuple[datetime, str, float | None]]:
+    """PSX company dividend notices (dps.psx.com.pk — same host as psxdata)."""
+    scraper = _get_etf_scraper()
+    sym = symbol.upper()
+    out: list[tuple[datetime, str, float | None]] = []
+    count = 100
+    offset = 0
+    seen: set[tuple[str, str]] = set()
+    while offset <= max_offset:
+        payload = {
+            "type": "C",
+            "symbol": sym,
+            "query": "dividend",
+            "count": count,
+            "offset": offset,
+            "date_from": "",
+            "date_to": "",
+            "page": "annc",
+        }
+        resp = scraper._request(
+            "POST",
+            f"{BASE_URL}/announcements",
+            headers={
+                **dict(REQUEST_HEADERS),
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": f"{BASE_URL}/company/{sym}",
+            },
+            data=payload,
+        )
+        soup = BeautifulSoup(resp.text, "html.parser")
+        table = soup.select_one("#announcementsTable")
+        if table is None:
+            break
+        body_rows = table.select("tbody tr")
+        if not body_rows:
+            break
+        for tr in body_rows:
+            tds = tr.select("td")
+            if len(tds) < 5:
+                continue
+            date_s = tds[0].get_text(strip=True)
+            title = tds[4].get_text(" ", strip=True)
+            if not _is_psx_dividend_payment_notice(title):
+                continue
+            key = (date_s, title[:100].lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            dt = _parse_psx_announcement_date(date_s)
+            if dt is None:
+                continue
+            out.append((dt, title, _parse_dps_amount_from_notice(title)))
+        if len(body_rows) < count:
+            break
+        offset += count
     out.sort(key=lambda p: p[0], reverse=True)
     return out
+
+
+def _summarize_psx_dividend_notices(
+    notices: list[tuple[datetime, str, float | None]],
+    *,
+    lookback_years: int = _DPS_LOOKBACK_YEARS,
+) -> dict:
+    now = datetime.now(timezone.utc)
+    current_year = now.year
+    start_year = current_year - lookback_years + 1
+    credits_by_year: dict[int, int] = {}
+    amounts_by_year: dict[int, list[float]] = {}
+    for dt, _title, amt in notices:
+        y = dt.year
+        if y < start_year or y > current_year:
+            continue
+        credits_by_year[y] = credits_by_year.get(y, 0) + 1
+        if amt is not None:
+            amounts_by_year.setdefault(y, []).append(amt)
+    years_sorted = sorted(credits_by_year.keys(), reverse=True)
+    annual_totals = {
+        y: float(sum(amounts_by_year[y]))
+        for y in years_sorted
+        if y in amounts_by_year and amounts_by_year[y]
+    }
+    last_calendar = annual_totals.get(current_year - 1)
+    if last_calendar is None and annual_totals:
+        last_calendar = annual_totals[years_sorted[0]]
+    return {
+        "lookback_years": lookback_years,
+        "years_with_dividends": len(credits_by_year),
+        "annual_totals_by_year": annual_totals,
+        "annual_dps_newest_first": [annual_totals[y] for y in years_sorted if y in annual_totals],
+        "credits_by_year": credits_by_year,
+        "payments_count": sum(credits_by_year.values()),
+        "last_fiscal_total": last_calendar,
+        "source": "psx_announcements",
+    }
+
+
+def _merge_dps_summaries(yahoo: dict | None, psx: dict | None) -> dict:
+    """Prefer Yahoo Rs totals; fill year coverage from PSX credit notices."""
+    if not yahoo and not psx:
+        return {
+            "lookback_years": _DPS_LOOKBACK_YEARS,
+            "years_with_dividends": 0,
+            "annual_totals_by_year": {},
+            "annual_dps_newest_first": [],
+            "last_fiscal_total": None,
+            "source": "none",
+        }
+    if not yahoo:
+        return psx or {}
+    if not psx:
+        return yahoo
+    lb = int(yahoo.get("lookback_years") or psx.get("lookback_years") or _DPS_LOOKBACK_YEARS)
+    y_totals = dict(yahoo.get("annual_totals_by_year") or {})
+    p_credits = dict(psx.get("credits_by_year") or {})
+    p_totals = dict(psx.get("annual_totals_by_year") or {})
+    all_years = set(y_totals) | set(p_credits) | set(p_totals)
+    merged_totals = dict(y_totals)
+    for y, val in p_totals.items():
+        if y not in merged_totals:
+            merged_totals[y] = val
+    years_with = len(all_years)
+    years_sorted = sorted(all_years, reverse=True)
+    last = yahoo.get("last_fiscal_total")
+    if last is None:
+        last = psx.get("last_fiscal_total")
+    return {
+        "lookback_years": lb,
+        "years_with_dividends": years_with,
+        "annual_totals_by_year": merged_totals,
+        "annual_dps_newest_first": [merged_totals[y] for y in years_sorted if y in merged_totals],
+        "credits_by_year": p_credits,
+        "payments_count": int(yahoo.get("payments_count") or 0)
+        + int(psx.get("payments_count") or 0),
+        "last_fiscal_total": last,
+        "source": "yahoo+psx",
+    }
 
 
 def _summarize_dps_payments(
@@ -1755,27 +1969,45 @@ def _dps_history(symbol: str) -> dict:
     sym = symbol.upper()
     if sym in _dividend_history_cache:
         return _dividend_history_cache[sym]
-    summary: dict = {
-        "lookback_years": _DPS_LOOKBACK_YEARS,
-        "years_with_dividends": 0,
-        "annual_dps_newest_first": [],
-        "annual_totals_by_year": {},
-        "last_fiscal_total": None,
-        "source": "none",
-        "implied_dps": None,
-    }
+    yahoo_summary: dict | None = None
+    psx_summary: dict | None = None
     if _yahoo_dividends_enabled():
         try:
             payments = _fetch_yahoo_dividend_payments(sym)
             if payments:
-                summary = _summarize_dps_payments(payments)
+                yahoo_summary = _summarize_dps_payments(payments)
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, KeyError, ValueError):
             pass
+    if _psx_dividends_enabled():
+        try:
+            notices = _fetch_psx_dividend_notices(sym)
+            if notices:
+                psx_summary = _summarize_psx_dividend_notices(notices)
+        except Exception:
+            pass
+    if yahoo_summary and psx_summary:
+        summary = _merge_dps_summaries(yahoo_summary, psx_summary)
+    elif yahoo_summary:
+        summary = yahoo_summary
+    elif psx_summary:
+        summary = psx_summary
+    else:
+        summary = {
+            "lookback_years": _DPS_LOOKBACK_YEARS,
+            "years_with_dividends": 0,
+            "annual_dps_newest_first": [],
+            "annual_totals_by_year": {},
+            "last_fiscal_total": None,
+            "source": "none",
+            "implied_dps": None,
+        }
     if summary.get("years_with_dividends", 0) == 0:
         implied = _implied_dps_from_screener(sym)
         if implied is not None and implied > 0:
+            summary = dict(summary)
             summary["implied_dps"] = implied
-            summary["source"] = "screener_implied"
+            if summary.get("source") == "none":
+                summary["source"] = "screener_implied"
     _dividend_history_cache[sym] = summary
     return summary
 
@@ -1787,7 +2019,18 @@ def _describe_dps_regularity(summary: dict) -> tuple[str, bool]:
     lb = int(summary.get("lookback_years") or _DPS_LOOKBACK_YEARS)
     y = int(summary.get("years_with_dividends") or 0)
     last = summary.get("last_fiscal_total")
-    last_s = f" · FY DPS Rs {float(last):.2f}" if last is not None else ""
+    credits = summary.get("credits_by_year") or {}
+    src = str(summary.get("source") or "")
+    if last is not None:
+        last_s = f" · FY DPS Rs {float(last):.2f}"
+    elif credits:
+        cy = datetime.now(timezone.utc).year - 1
+        c = credits.get(cy) or credits.get(max(credits.keys(), default=0), 0)
+        last_s = f" · {c} PSX credit(s) in latest FY" if c else ""
+    else:
+        last_s = ""
+    if "psx" in src and last is None and y > 0:
+        last_s = (last_s or "") + " (PSX notices; Rs/sh if not in title)"
     if summary.get("source") == "screener_implied":
         imp = summary.get("implied_dps")
         if imp:
@@ -1807,7 +2050,12 @@ def _print_dps_consistency_table(symbols: list[str]) -> dict[str, tuple[str, boo
     notes: dict[str, tuple[str, bool]] = {}
     if not symbols:
         return notes
-    src = "Yahoo 5y cash dividends (.KA)" if _yahoo_dividends_enabled() else "PSX screener implied only"
+    parts = []
+    if _yahoo_dividends_enabled():
+        parts.append("Yahoo cash amounts")
+    if _psx_dividends_enabled():
+        parts.append("PSX dividend notices (dps.psx.com.pk)")
+    src = " + ".join(parts) if parts else "PSX screener implied only"
     print(f"\n  Cash dividend / DPS check ({src}):\n")
     rows: list[dict] = []
     n = len(symbols)
@@ -1819,15 +2067,24 @@ def _print_dps_consistency_table(symbols: list[str]) -> dict[str, tuple[str, boo
         note, irregular = _describe_dps_regularity(hist)
         notes[sym] = (note, irregular)
         totals = hist.get("annual_totals_by_year") or {}
-        years = sorted(totals.keys(), reverse=True)
-        y1 = f"{totals[years[0]]:.2f}" if years else "—"
-        y2 = f"{totals[years[1]]:.2f}" if len(years) > 1 else "—"
+        credits = hist.get("credits_by_year") or {}
+        years = sorted(set(totals.keys()) | set(credits.keys()), reverse=True)
+
+        def _fy_cell(y: int) -> str:
+            if y in totals:
+                return f"{totals[y]:.2f}"
+            if y in credits:
+                return f"{credits[y]} cr"
+            return "—"
+
+        y1 = _fy_cell(years[0]) if years else "—"
+        y2 = _fy_cell(years[1]) if len(years) > 1 else "—"
         rows.append(
             {
                 "symbol": sym,
                 "years_paid": f"{hist.get('years_with_dividends', 0)}/{hist.get('lookback_years', 5)}",
-                "fy_dps_latest": y1,
-                "fy_dps_prior": y2,
+                "fy_latest": y1,
+                "fy_prior": y2,
                 "dps_status": note,
             }
         )
@@ -1838,7 +2095,10 @@ def _print_dps_consistency_table(symbols: list[str]) -> dict[str, tuple[str, boo
         f"{_DPS_LOOKBACK_YEARS - 1} of last {_DPS_LOOKBACK_YEARS} calendar years."
     )
     if not _yahoo_dividends_enabled():
-        print("  (PSX_SIP_NO_YAHOO=1 — enable Yahoo for full payment history.)")
+        print("  (PSX_SIP_NO_YAHOO=1 — Yahoo Rs/sh amounts skipped.)")
+    if not _psx_dividends_enabled():
+        print("  (PSX_SIP_NO_PSX_DIV=1 — PSX notice fallback skipped.)")
+    print("  fy_* = Rs DPS total when known, else PSX credit count (cr) that year.")
     return notes
 
 
