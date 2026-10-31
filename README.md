@@ -6,14 +6,42 @@ Interactive **Pakistan Stock Exchange (PSX)** tool for index/ETF/dividend SIP pl
 
 Data comes from [psxdata](https://pypi.org/project/psxdata/) (PSX Data Portal).
 
-**Author:** Salim Ali Khan · **Version:** 1.4.4 · **Date:** October 2026
+**Author:** Salim Ali Khan · **Version:** 1.4.5 · **Date:** October 2026
 
 ## Requirements
 
 - Python **3.10+**
 - Network access to `dps.psx.com.pk`
 
-## Run on any machine (recommended — full repo)
+## Run with curl (any machine, no clone)
+
+From the folder where you keep CSV exports (`cd` there first):
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/salimalikhan22/psx-sip/main/psx_sip_planner.py" | python3 -
+```
+
+Shorthand (same as above; `-s` silent, `-f` fail on HTTP errors):
+
+```bash
+curl -sSf "https://raw.githubusercontent.com/salimalikhan22/psx-sip/main/psx_sip_planner.py" | python3 -
+```
+
+- Prompts use your **terminal** (`/dev/tty`) even though the script comes from a pipe.
+- **Index / ETF / dividend screened SIP / scanner** work without a git checkout.
+- **Mutual-fund reference** (menu 4 / holdings view): on first use, downloads  
+  `dividend_fund_composition.json` from GitHub into **`~/.psx-sip/`** (needs network once).
+- Plan/holdings CSVs are read/written in your **current working directory** only.
+
+Override the download base URL (fork or branch):
+
+```bash
+export PSX_SIP_REPO_RAW="https://raw.githubusercontent.com/YOUR_USER/psx-sip/main"
+```
+
+Force re-download fund JSON: `PSX_SIP_REFRESH_FUNDS=1`
+
+## Run from git clone (offline-friendly fund data)
 
 Clone this repository, create a venv, install deps, run from the folder where you keep your CSV exports:
 
@@ -61,16 +89,6 @@ These files are **required** for the full planner (including dividend fund refer
 
 Local helper scripts such as `build_dividend_*.py` and generated spreadsheets are **optional** and intentionally not published.
 
-## Single-file download (limited)
-
-Index/ETF/scanner paths work if you only fetch the main script. **Dividend fund blend / FMR menus** need `dividend_funds_data.py` and `data/dividend_fund_composition.json` beside the script (use `git clone` above).
-
-```bash
-curl -fsSL -o psx_sip_planner.py \
-  "https://raw.githubusercontent.com/salimalikhan22/psx-sip/main/psx_sip_planner.py"
-python3 psx_sip_planner.py
-```
-
 ## Privacy
 
 - Source on GitHub contains **no portfolio data**.
@@ -105,6 +123,8 @@ python3 psx_sip_planner.py
 | `PSX_SIP_PRELOAD_ETF_CATALOG` | Pre-fetch all ETF baskets before pick |
 | `PSX_SIP_SKIP_BOOTSTRAP` / `PSX_SIP_NO_PIP` | Control dependency install |
 | `PSX_SIP_VERBOSE` | Show psxdata scraper warnings |
+| `PSX_SIP_REPO_RAW` | GitHub raw base URL for curl-mode fund JSON bootstrap |
+| `PSX_SIP_REFRESH_FUNDS` | Re-download fund reference JSON into `~/.psx-sip/` |
 
 ## psxdata warnings
 

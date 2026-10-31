@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.4.4"
+__version__ = "1.4.5"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -151,6 +151,10 @@ def fetch_stocks(
 BOARD_LOT = 500
 DEFAULT_COST_BUFFER_PCT = 0.5
 HOLDINGS_SNAPSHOT_VERSION = "2"
+# Raw GitHub base for curl | python3 bootstrap (override with PSX_SIP_REPO_RAW).
+DEFAULT_PSX_SIP_REPO_RAW = (
+    "https://raw.githubusercontent.com/salimalikhan22/psx-sip/main"
+)
 # Extra folders to scan for psx_sip_*.csv (user-picked this session only).
 _session_csv_search_dirs: list[str] = []
 
@@ -1141,6 +1145,7 @@ Quick reference (type h or ? at any menu):
   • New vs top-up: if a holdings file exists, you see holdings vs basket before you choose.
   • CSV auto-find: current folder only; if empty, you can name another folder to search.
   • Optional: PSX_SIP_CSV_DIRS=path1,path2 always adds extra search folders.
+  • curl | python3: fund JSON auto-downloads to ~/.psx-sip/ (PSX_SIP_REPO_RAW to override).
   • Snapshot load shows basket drift (new/dropped names, weight shifts).
   • Match check (menu 4): Index or ETF → CSV or SYMBOL:qty → resemblance %.
   • Paths: relative (from cwd), absolute, or ~/file.csv — all work.
@@ -1155,6 +1160,13 @@ Quick reference (type h or ? at any menu):
 
 def print_startup_reminders() -> None:
     print("  Menus: type h or ? for shortcuts.")
+    if _running_from_stdin():
+        print(
+            "  Running from curl | python3 — fund data caches to ~/.psx-sip/ when needed."
+        )
+        print(
+            f"  CSV exports: save in your current folder ({os.getcwd()})."
+        )
     if _use_data_cache():
         print(
             "  Data cache: ON (psxdata disk ~15 min + in-session ETF). "
@@ -3022,12 +3034,90 @@ def build_yield_weighted_dividend_basket(
     )
 
 
+def _running_from_stdin() -> bool:
+    """True when the planner was piped (curl … | python3 -), not loaded from a .py file."""
+    try:
+        base = os.path.basename(os.path.abspath(__file__))
+    except NameError:
+        return True
+    return base in ("<stdin>", "-")
+
+
 def _planner_root() -> str:
+    if _running_from_stdin():
+        return os.getcwd()
     return os.path.dirname(os.path.abspath(__file__))
 
 
 def _planner_data_dir() -> str:
     return os.path.join(_planner_root(), "data")
+
+
+def _psx_sip_cache_dir() -> str:
+    return os.path.expanduser("~/.psx-sip")
+
+
+def _remote_repo_raw_base() -> str:
+    raw = os.environ.get("PSX_SIP_REPO_RAW", "").strip()
+    return (raw or DEFAULT_PSX_SIP_REPO_RAW).rstrip("/")
+
+
+def _fetch_url_text(url: str, *, timeout: float = 45.0) -> str | None:
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": f"psx-sip-planner/{__version__}"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8")
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+        return None
+
+
+def _ensure_dividend_fund_json_cached(*, quiet: bool = False) -> str | None:
+    """
+    Download data/dividend_fund_composition.json for curl | python3 runs.
+    Cached under ~/.psx-sip/ (refreshed when missing or PSX_SIP_REFRESH_FUNDS=1).
+    """
+    cache_dir = _psx_sip_cache_dir()
+    dest = os.path.join(cache_dir, "dividend_fund_composition.json")
+    refresh = os.environ.get("PSX_SIP_REFRESH_FUNDS", "").strip().lower() in (
+        "1",
+        "yes",
+        "true",
+    )
+    if (
+        not refresh
+        and os.path.isfile(dest)
+        and os.path.getsize(dest) > 200
+    ):
+        return dest
+    url = f"{_remote_repo_raw_base()}/data/dividend_fund_composition.json"
+    if not quiet:
+        print(
+            f"\n  Fetching dividend fund reference (one-time cache → {dest})…",
+            flush=True,
+        )
+    body = _fetch_url_text(url)
+    if not body:
+        if not quiet:
+            print("  Could not download fund reference JSON (check network / PSX_SIP_REPO_RAW).")
+        return dest if os.path.isfile(dest) else None
+    try:
+        payload = json.loads(body)
+        funds = payload.get("funds") or []
+        if not funds:
+            raise ValueError("empty funds")
+    except (json.JSONDecodeError, ValueError):
+        if not quiet:
+            print("  Downloaded fund reference JSON was invalid.")
+        return dest if os.path.isfile(dest) else None
+    os.makedirs(cache_dir, exist_ok=True)
+    with open(dest, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    if not quiet:
+        print(f"  Saved fund reference: {dest}")
+    return dest
 
 
 def _load_bundled_dividend_funds_module() -> list[dict]:
@@ -3071,6 +3161,19 @@ def _load_dividend_fund_compositions() -> list[dict]:
                 return out
         except (OSError, json.JSONDecodeError):
             continue
+    cached = _ensure_dividend_fund_json_cached(
+        quiet=not _running_from_stdin()
+    )
+    if cached and os.path.isfile(cached):
+        try:
+            with open(cached, encoding="utf-8") as fh:
+                payload = json.load(fh)
+            funds = payload.get("funds") or []
+            out = [f for f in funds if isinstance(f, dict) and f.get("holdings")]
+            if out:
+                return out
+        except (OSError, json.JSONDecodeError):
+            pass
     return _load_bundled_dividend_funds_module()
 
 
