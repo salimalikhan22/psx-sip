@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.3.7"
+__version__ = "1.4.4"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -68,6 +68,7 @@ def _bootstrap_dependencies() -> None:
 
 _bootstrap_dependencies()
 
+import glob
 import json
 import logging
 import math
@@ -150,6 +151,205 @@ def fetch_stocks(
 BOARD_LOT = 500
 DEFAULT_COST_BUFFER_PCT = 0.5
 HOLDINGS_SNAPSHOT_VERSION = "2"
+# Extra folders to scan for psx_sip_*.csv (user-picked this session only).
+_session_csv_search_dirs: list[str] = []
+
+
+def _export_date_tag() -> str:
+    """Local calendar date for export filenames (DD_MM_YYYY)."""
+    return datetime.now().strftime("%d_%m_%Y")
+
+
+def _export_source_slug(source_id: str, fallback: str = "plan") -> str:
+    raw = (source_id or fallback).lower()
+    return re.sub(r"[^\w\-]+", "_", raw).strip("_")[:50]
+
+
+def export_plan_csv_name(source_id: str) -> str:
+    return f"psx_sip_plan_{_export_source_slug(source_id)}_{_export_date_tag()}.csv"
+
+
+def export_holdings_csv_name(source_id: str) -> str:
+    return (
+        f"psx_sip_holdings_{_export_source_slug(source_id, 'holdings')}"
+        f"_{_export_date_tag()}.csv"
+    )
+
+
+def holdings_snapshot_glob_pattern(source_id: str) -> str:
+    slug = _export_source_slug(source_id, "holdings")
+    return f"psx_sip_holdings_{slug}_*.csv"
+
+
+def _csv_search_directories() -> list[str]:
+    """Folders scanned for psx_sip_*.csv: cwd, session picks, optional PSX_SIP_CSV_DIRS."""
+    candidates: list[str] = [os.getcwd(), *_session_csv_search_dirs]
+    extra = os.environ.get("PSX_SIP_CSV_DIRS", "").strip()
+    if extra:
+        for part in extra.replace(";", ",").split(","):
+            part = part.strip()
+            if part:
+                candidates.append(part)
+    seen: set[str] = set()
+    roots: list[str] = []
+    for raw in candidates:
+        absp = os.path.abspath(os.path.expanduser(raw))
+        if absp in seen or not os.path.isdir(absp):
+            continue
+        seen.add(absp)
+        roots.append(absp)
+    return roots
+
+
+def _csv_location_label(path: str, roots: list[str]) -> str:
+    absp = os.path.abspath(path)
+    cwd = os.path.abspath(os.getcwd())
+    for root in roots:
+        try:
+            if os.path.commonpath([absp, root]) != root:
+                continue
+        except ValueError:
+            continue
+        if os.path.abspath(root) == cwd:
+            return "current folder"
+        return os.path.basename(root) or root
+    return "file"
+
+
+def _maybe_prompt_csv_search_folder() -> bool:
+    """Ask for a folder to scan when cwd has no exports. Returns True if one was added."""
+    cwd = os.getcwd()
+    print(f"\n  No psx_sip_*.csv in the current folder:\n    {cwd}")
+    raw = prompt(
+        "  Folder to search for plan/holdings CSVs "
+        "(Enter = skip; you can type a file path instead): "
+    ).strip()
+    if not raw:
+        return False
+    if _is_help_choice(raw):
+        print_usage_tips()
+        return _maybe_prompt_csv_search_folder()
+    path = os.path.abspath(os.path.expanduser(raw.strip()))
+    if os.path.isdir(path):
+        if path in _session_csv_search_dirs or path == cwd:
+            print("  That folder is already included in the search.")
+            return False
+        _session_csv_search_dirs.append(path)
+        print(f"  Added search folder: {path}")
+        return True
+    if os.path.isfile(path):
+        print("  That is a file — give a folder path, or Enter then type the CSV file.")
+        return False
+    print(f"  Folder not found: {path}")
+    return False
+
+
+def _csv_export_kind(filename: str) -> str:
+    low = filename.lower()
+    if low.startswith("psx_sip_holdings"):
+        return "holdings"
+    if low.startswith("psx_sip_plan"):
+        return "plan"
+    if low.startswith("psx_scan"):
+        return "scan"
+    return "csv"
+
+
+def discover_psx_sip_csv_files(
+    *,
+    source_id: str = "",
+    include_plans: bool = True,
+    include_holdings: bool = True,
+    include_scans: bool = False,
+    max_results: int = 30,
+    prompt_extra_folder: bool = False,
+) -> list[tuple[str, str]]:
+    """
+    (label, absolute_path) newest first; scans cwd (+ session / PSX_SIP_CSV_DIRS).
+    """
+    roots = _csv_search_directories()
+    patterns: list[str] = []
+    if include_holdings:
+        patterns.append("psx_sip_holdings*.csv")
+    if include_plans:
+        patterns.append("psx_sip_plan*.csv")
+    if include_scans:
+        patterns.append("psx_scan_*.csv")
+
+    by_path: dict[str, float] = {}
+    for root in roots:
+        for pat in patterns:
+            for path in glob.glob(os.path.join(root, pat)):
+                absp = os.path.abspath(path)
+                if os.path.isfile(absp):
+                    by_path[absp] = os.path.getmtime(absp)
+
+    slug = _export_source_slug(source_id, "") if source_id else ""
+    sid_low = source_id.lower() if source_id else ""
+    ranked: list[tuple[int, float, str, str]] = []
+    for path, mtime in by_path.items():
+        name = os.path.basename(path)
+        pri = 0
+        name_low = name.lower()
+        if slug and slug in name_low:
+            pri = 3
+        elif sid_low and sid_low in name_low:
+            pri = 2
+        elif _csv_export_kind(name) == "holdings":
+            pri = 1
+        loc = _csv_location_label(path, roots)
+        mod = datetime.fromtimestamp(mtime).strftime("%d-%m-%Y %H:%M")
+        kind = _csv_export_kind(name)
+        label = f"{kind} · {loc} · {name} · {mod}"
+        ranked.append((pri, mtime, label, path))
+
+    ranked.sort(key=lambda r: (r[0], r[1]), reverse=True)
+    out = [(label, path) for _pri, _mt, label, path in ranked[:max_results]]
+    if out or not prompt_extra_folder:
+        return out
+    if _maybe_prompt_csv_search_folder():
+        return discover_psx_sip_csv_files(
+            source_id=source_id,
+            include_plans=include_plans,
+            include_holdings=include_holdings,
+            include_scans=include_scans,
+            max_results=max_results,
+            prompt_extra_folder=False,
+        )
+    return []
+
+
+def resolve_default_holdings_snapshot_path(source_id: str) -> str:
+    """Newest holdings CSV in search dirs (cwd first), else legacy undated, else today's name."""
+    slug = _export_source_slug(source_id, "holdings")
+    roots = _csv_search_directories()
+    dated: list[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        for pat in (f"psx_sip_holdings_{slug}_*.csv", "psx_sip_holdings*.csv"):
+            for path in glob.glob(os.path.join(root, pat)):
+                absp = os.path.abspath(path)
+                if absp in seen or not os.path.isfile(absp):
+                    continue
+                seen.add(absp)
+                dated.append(absp)
+    if dated:
+        dated.sort(key=os.path.getmtime, reverse=True)
+        if source_id:
+            matched = [
+                p for p in dated if slug in os.path.basename(p).lower()
+            ]
+            if matched:
+                matched.sort(key=os.path.getmtime, reverse=True)
+                return matched[0]
+        return dated[0]
+    for root in roots:
+        legacy = os.path.join(root, f"psx_sip_holdings_{source_id.lower()}.csv")
+        if os.path.isfile(legacy):
+            return legacy
+    return export_holdings_csv_name(source_id)
+
+
 MISSING_WEIGHT_ALERT_PCT = 3.0
 MISSING_TOP_N_ALERT = 10
 MISSING_TOTAL_WEIGHT_ALERT_PCT = 15.0
@@ -930,14 +1130,17 @@ def print_usage_tips() -> None:
     print(
         """
 Quick reference (type h or ? at any menu):
-  • Index & ETF (menus 1 & 2): new plan, top-up, scope, exclusions, snapshots.
-  • Stock scanner (menu 5): filter screener (P/E, yield, …) + optional EPS / profit from PSX.
-  • Top-up: 1 held weights / 2 equal / 3 gap-fill / 4 dividend tilt (blend + optional rotate 2–3 names).
-  • Top-up: optional sector/symbol exclusions (e.g. skip CEMENT this month).
-  • Top-up: portfolio mix + new-money ideas (sector, dividend) before you exclude anything.
-  • Top-up buy filter: dividend-first (keep regular DPS) or strict P/E+EPS — or N after DPS table / mix deprioritize.
-  • Top-up mix guide: EPS + DPS (Yahoo cash amounts when available; PSX dividend notices via dps.psx.com.pk as fallback).
-  • Dividend-focused SIP: main menu 6 (PSXDIV20, fund blends, yield basket).
+  • Main: 1 Invest (index / ETF / dividend basket) · 2 Insights (overview, compare, scanner).
+  • Index & ETF: scope, sector/symbol exclusions, new plan or top-up.
+  • Dividend basket: build once (DPS + yield; EPS optional) → invest skips scope — optional skip symbol, then PKR.
+  • Insights scanner: P/E, yield, EPS research — optional basket, separate from Invest dividend flow.
+  • Top-up: held weights / equal / gap-fill / dividend tilt; optional sector skip this month.
+  • Index/ETF top-up: optional buy filter (dividend-first or strict P/E+EPS). Dividend basket top-up skips that filter.
+  • Before SIP: at basket confirm, type r to swap lines; why SYM for diagnosis.
+  • Exports default to dated names: psx_sip_plan_<id>_DD_MM_YYYY.csv and psx_sip_holdings_<id>_DD_MM_YYYY.csv.
+  • New vs top-up: if a holdings file exists, you see holdings vs basket before you choose.
+  • CSV auto-find: current folder only; if empty, you can name another folder to search.
+  • Optional: PSX_SIP_CSV_DIRS=path1,path2 always adds extra search folders.
   • Snapshot load shows basket drift (new/dropped names, weight shifts).
   • Match check (menu 4): Index or ETF → CSV or SYMBOL:qty → resemblance %.
   • Paths: relative (from cwd), absolute, or ~/file.csv — all work.
@@ -970,61 +1173,90 @@ def print_startup_reminders() -> None:
         tag = f" ({sid})" if sid else ""
         print(f"  Last holdings file{tag}: {last}")
         print(f"  Next top-up: menu 2, or PSX_SIP_HOLDINGS={last!r}")
+    found = discover_psx_sip_csv_files(max_results=50, prompt_extra_folder=False)
+    if found:
+        print(
+            f"  Found {len(found)} PSX SIP CSV(s) in {os.getcwd()} "
+            "(top-up / holdings prompts will list them)."
+        )
 
 
 def _is_help_choice(choice: str) -> bool:
     return choice.strip().lower() in ("h", "?", "help")
 
 
-def choose_product_type() -> str:
-    print("\nWhat would you like to plan?\n")
-    print(
-        "  1. PSX Index SIP (new / top-up / scope — same features as ETF)"
-    )
-    print(
-        "  2. ETF SIP (new / top-up / scope — creation-unit basket)"
-    )
-    print("  3. Insights (indices, ETFs, sector leaders — no SIP plan)")
-    print(
-        "  4. Compare my holdings to an index/ETF "
-        "(CSV or shares — how close am I?)"
-    )
-    print(
-        "  5. Stock scanner (P/E, dividend yield, EPS — research filter)"
-    )
-    print(
-        "  6. Dividend SIP (PSXDIV20, fund reference, yield-weighted basket)"
-    )
+def choose_top_level_mode() -> str:
+    print("\nWhat would you like to do?\n")
+    print("  1. Invest — SIP plan (index, ETF, or dividend basket)")
+    print("  2. Insights — research & compare (no SIP plan)")
     print("  h. Help (shortcuts)")
-    print()
     while True:
         choice = prompt("Select [1]: ") or "1"
         if _is_help_choice(choice):
             print_usage_tips()
             continue
-        if choice in ("1", "index", "i"):
+        if choice in ("1", "invest", "sip", "plan"):
+            return "invest"
+        if choice in ("2", "insights", "research", "insight", "i"):
+            return "insights"
+        print("  Enter 1, 2, or h.")
+
+
+def choose_invest_product() -> str:
+    print(
+        "\n  Invest via:\n"
+        "  1. PSX Index — full index SIP (scope, exclusions; EPS/P/E matter more)\n"
+        "  2. ETF — creation-unit basket (same SIP tools as index)\n"
+        "  3. Dividend income — DPS + yield basket (EPS optional; basket → invest)"
+    )
+    while True:
+        choice = prompt("Select [1]: ") or "1"
+        if _is_help_choice(choice):
+            print_usage_tips()
+            continue
+        if choice in ("1", "index", "idx"):
             return "index"
         if choice in ("2", "etf", "e"):
             return "etf"
-        if choice in ("3", "insights", "insight"):
-            return "insights"
-        if choice in ("4", "compare", "match", "align", "holdings"):
-            return "align"
-        if choice in ("5", "7", "scan", "scanner", "screener", "screen"):
-            return "scanner"
         if choice in (
-            "6",
-            "custom",
-            "basket",
-            "smart",
-            "blend",
+            "3",
             "dividend",
             "div",
             "income",
             "yield",
+            "6",
         ):
             return "dividend"
-        print("  Enter 1–6, or h.")
+        print("  Enter 1–3, or h.")
+
+
+def choose_insights_product() -> str:
+    print(
+        "\n  Insights:\n"
+        "  1. Market overview (indices, ETFs, sector leaders)\n"
+        "  2. Compare my holdings to an index/ETF\n"
+        "  3. Stock scanner (P/E, dividend yield, EPS — research)"
+    )
+    while True:
+        choice = prompt("Select [1]: ") or "1"
+        if _is_help_choice(choice):
+            print_usage_tips()
+            continue
+        if choice in ("1", "insights", "market", "overview"):
+            return "insights"
+        if choice in ("2", "compare", "match", "align", "holdings", "4"):
+            return "align"
+        if choice in ("3", "scan", "scanner", "screener", "5"):
+            return "scanner"
+        print("  Enter 1–3, or h.")
+
+
+def choose_product_type() -> str:
+    """Top-level menu: invest (index/ETF/dividend) or insights tools."""
+    mode = choose_top_level_mode()
+    if mode == "insights":
+        return choose_insights_product()
+    return choose_invest_product()
 
 
 def prompt_return_to_menu() -> bool:
@@ -1316,6 +1548,20 @@ def prompt_positive_float(label: str, default: float | None = None) -> float:
             print("  Amount must be greater than zero.")
             continue
         return value
+
+
+def prompt_yes_no(label: str, *, default_yes: bool) -> bool:
+    """y/n prompt; empty line uses default_yes."""
+    tag = "Y/n" if default_yes else "y/N"
+    raw = prompt(f"{label} [{tag}]: ").strip().lower()
+    if not raw:
+        return default_yes
+    if raw in ("y", "yes"):
+        return True
+    if raw in ("n", "no"):
+        return False
+    print("  Enter y or n.")
+    return prompt_yes_no(label, default_yes=default_yes)
 
 
 def prompt_non_negative_float(label: str, default: float) -> float:
@@ -1965,10 +2211,84 @@ def _screener_row(symbol: str) -> pd.Series | None:
     return hit.iloc[0]
 
 
-def _dps_history(symbol: str) -> dict:
-    sym = symbol.upper()
-    if sym in _dividend_history_cache:
-        return _dividend_history_cache[sym]
+def _related_equity_symbol_variants(symbol: str) -> list[str]:
+    """Same company may appear as HUBC (symbols table) vs HUBCXD (screener/index)."""
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return []
+    variants: list[str] = [sym]
+    if sym.endswith("XD"):
+        base = sym[:-2]
+        if base and base not in variants:
+            variants.append(base)
+    else:
+        xd = sym + "XD"
+        if xd not in variants:
+            variants.append(xd)
+    tradable = _tradable_equity_symbol(sym)
+    if tradable and tradable not in variants:
+        variants.append(tradable)
+    return variants
+
+
+_symbols_name_sector_cache: dict[str, tuple[str, str]] | None = None
+
+
+def _symbols_name_sector_maps() -> tuple[dict[str, str], dict[str, str]]:
+    global _symbols_name_sector_cache
+    if _symbols_name_sector_cache is not None:
+        names, sectors = _symbols_name_sector_cache
+        return names, sectors
+    names: dict[str, str] = {}
+    sectors: dict[str, str] = {}
+    sym_meta = fetch_symbols()
+    if "symbol" in sym_meta.columns:
+        for _, row in sym_meta.iterrows():
+            s = str(row["symbol"]).upper()
+            names[s] = str(row.get("name", s) or s)
+            sectors[s] = str(row.get("sector_name", "") or "UNKNOWN")
+    _symbols_name_sector_cache = (names, sectors)
+    return names, sectors
+
+
+def _resolve_company_name(symbol: str) -> str:
+    sym = str(symbol or "").upper().strip()
+    names, _sectors = _symbols_name_sector_maps()
+    for variant in _related_equity_symbol_variants(sym):
+        nm = names.get(variant, "").strip()
+        if nm and nm.upper() != variant and nm.lower() != "nan":
+            return nm
+    for variant in _related_equity_symbol_variants(sym):
+        row = _screener_row(variant)
+        if row is None:
+            continue
+        nm = row.get("name")
+        if nm is not None and pd.notna(nm):
+            text = str(nm).strip()
+            if text and text.lower() != "nan":
+                return text
+    return sym
+
+
+def _resolve_sector_name(symbol: str, fallback: str = "UNKNOWN") -> str:
+    sym = str(symbol or "").upper().strip()
+    _names, sectors = _symbols_name_sector_maps()
+    for variant in _related_equity_symbol_variants(sym):
+        sec = sectors.get(variant, "").strip()
+        if sec and sec.upper() != "UNKNOWN":
+            return sec
+    for variant in _related_equity_symbol_variants(sym):
+        row = _screener_row(variant)
+        if row is None:
+            continue
+        sec = str(row.get("sector_name", "") or "").strip()
+        if sec and sec.upper() != "UNKNOWN":
+            return sec
+    fb = str(fallback or "").strip()
+    return fb if fb and fb.lower() != "nan" else "UNKNOWN"
+
+
+def _dps_history_for_symbol_variant(sym: str) -> dict:
     yahoo_summary: dict | None = None
     psx_summary: dict | None = None
     if _yahoo_dividends_enabled():
@@ -1986,23 +2306,42 @@ def _dps_history(symbol: str) -> dict:
         except Exception:
             pass
     if yahoo_summary and psx_summary:
-        summary = _merge_dps_summaries(yahoo_summary, psx_summary)
-    elif yahoo_summary:
-        summary = yahoo_summary
-    elif psx_summary:
-        summary = psx_summary
-    else:
-        summary = {
-            "lookback_years": _DPS_LOOKBACK_YEARS,
-            "years_with_dividends": 0,
-            "annual_dps_newest_first": [],
-            "annual_totals_by_year": {},
-            "last_fiscal_total": None,
-            "source": "none",
-            "implied_dps": None,
-        }
+        return _merge_dps_summaries(yahoo_summary, psx_summary)
+    if yahoo_summary:
+        return yahoo_summary
+    if psx_summary:
+        return psx_summary
+    return {
+        "lookback_years": _DPS_LOOKBACK_YEARS,
+        "years_with_dividends": 0,
+        "annual_dps_newest_first": [],
+        "annual_totals_by_year": {},
+        "last_fiscal_total": None,
+        "source": "none",
+        "implied_dps": None,
+    }
+
+
+def _dps_history(symbol: str) -> dict:
+    sym = symbol.upper()
+    if sym in _dividend_history_cache:
+        return _dividend_history_cache[sym]
+    best: dict | None = None
+    for variant in _related_equity_symbol_variants(sym):
+        summary = _dps_history_for_symbol_variant(variant)
+        y = int(summary.get("years_with_dividends") or 0)
+        if best is None or y > int(best.get("years_with_dividends") or 0):
+            best = summary
+        if y >= _DPS_LOOKBACK_YEARS - 1:
+            break
+    summary = best or _dps_history_for_symbol_variant(sym)
     if summary.get("years_with_dividends", 0) == 0:
         implied = _implied_dps_from_screener(sym)
+        if implied is None:
+            for variant in _related_equity_symbol_variants(sym):
+                implied = _implied_dps_from_screener(variant)
+                if implied is not None and implied > 0:
+                    break
         if implied is not None and implied > 0:
             summary = dict(summary)
             summary["implied_dps"] = implied
@@ -2012,12 +2351,102 @@ def _dps_history(symbol: str) -> dict:
     return summary
 
 
+def _dps_income_tier(summary: dict) -> str:
+    """
+    Income-screen tier from 5y DPS lookback:
+      regular (4-5/5), mixed (2-3/5), weak (1/5), none (0/5), yield_only (no history, screener yield).
+    """
+    if str(summary.get("source") or "") == "screener_implied":
+        imp = summary.get("implied_dps")
+        if imp is not None and float(imp) > 0:
+            return "yield_only"
+    lb = int(summary.get("lookback_years") or _DPS_LOOKBACK_YEARS)
+    y = int(summary.get("years_with_dividends") or 0)
+    if y == 0:
+        return "none"
+    if y >= lb - 1:
+        return "regular"
+    if y >= 2:
+        return "mixed"
+    return "weak"
+
+
+def _dps_tier_excluded(tier: str, mode: str) -> bool:
+    """Whether an income tier is dropped under off / lenient / balanced / strict."""
+    m = str(mode or "off").strip().lower()
+    if m in ("off", "n", "no", "0", "none"):
+        return False
+    if m in ("strict", "s"):
+        return tier not in ("regular",)
+    if m in ("lenient", "l"):
+        return tier == "none"
+    # balanced (default when filtering)
+    return tier in ("none", "weak")
+
+
+def _parse_dps_income_filter_mode(raw: str) -> str:
+    r = str(raw or "").strip().lower()
+    if r in ("n", "no", "0", "off", "none"):
+        return "off"
+    if r in ("3", "strict", "s"):
+        return "strict"
+    if r in ("1", "lenient", "l"):
+        return "lenient"
+    if r in ("", "2", "balanced", "moderate", "y", "yes", "b", "default"):
+        return "balanced"
+    return "balanced"
+
+
+def _dps_tier_rank_score(tier: str) -> float:
+    """Higher = better for dividend-first basket ordering."""
+    return {
+        "regular": 4.0,
+        "mixed": 3.0,
+        "yield_only": 2.0,
+        "weak": 1.0,
+        "none": 0.0,
+    }.get(str(tier), 0.0)
+
+
+def prompt_dividend_eps_filter() -> bool:
+    """Dividend SIP: EPS off by default; DPS + yield drive selection."""
+    print(
+        "\n  Dividend-first: DPS regularity and yield matter most for income names."
+    )
+    return prompt_yes_no(
+        "Also drop stocks with EPS down 2+ years? "
+        "(strict — often removes FABL/MEBL-style payers)",
+        default_yes=False,
+    )
+
+
+def prompt_dps_income_filter() -> str:
+    print(
+        "\n  DPS history filter (5-year lookback — not advice):\n"
+        "    1. Off — no DPS filter\n"
+        "    2. Balanced — drop 0/5 and 1/5 only; keep 2/5+ (3/5, 4/5 OK) [default]\n"
+        "    3. Strict — keep 4/5+ regular payers only\n"
+        "    4. Lenient — drop 0/5 only (keep 1/5+ and yield-only)"
+    )
+    raw = prompt("DPS filter [2]: ").strip().lower() or "2"
+    mode = _parse_dps_income_filter_mode(raw)
+    labels = {
+        "off": "off",
+        "balanced": "balanced (2/5+ kept)",
+        "strict": "strict (4/5+ only)",
+        "lenient": "lenient (1/5+ kept)",
+    }
+    print(f"  Using DPS filter: {labels.get(mode, mode)}.")
+    return mode
+
+
 def _describe_dps_regularity(summary: dict) -> tuple[str, bool]:
     """
-    Label for display; second value True = weak / irregular payer (income screen).
+    Label for display; second value True = fails balanced income screen (0/5, 1/5).
     """
     lb = int(summary.get("lookback_years") or _DPS_LOOKBACK_YEARS)
     y = int(summary.get("years_with_dividends") or 0)
+    tier = _dps_income_tier(summary)
     last = summary.get("last_fiscal_total")
     credits = summary.get("credits_by_year") or {}
     src = str(summary.get("source") or "")
@@ -2031,18 +2460,24 @@ def _describe_dps_regularity(summary: dict) -> tuple[str, bool]:
         last_s = ""
     if "psx" in src and last is None and y > 0:
         last_s = (last_s or "") + " (PSX notices; Rs/sh if not in title)"
-    if summary.get("source") == "screener_implied":
+    if tier == "yield_only":
         imp = summary.get("implied_dps")
         if imp:
-            return (f"DPS ~Rs {float(imp):.2f}/sh (yield×price; no history)", False)
+            return (
+                f"DPS ~Rs {float(imp):.2f}/sh (yield×price; no 5y history)",
+                False,
+            )
         return ("DPS n/a", True)
-    if y == 0:
+    if tier == "none":
         return ("DPS no 5y payments", True)
-    if y >= lb - 1:
+    if tier == "regular":
         return (f"DPS regular {y}/{lb} yrs{last_s}", False)
-    if y >= max(2, lb // 2):
-        return (f"DPS mixed {y}/{lb} yrs{last_s}", False)
-    return (f"DPS irregular {y}/{lb} yrs{last_s}", True)
+    if tier == "mixed":
+        return (
+            f"DPS mixed {y}/{lb} yrs (OK for balanced filter){last_s}",
+            False,
+        )
+    return (f"DPS weak {y}/{lb} yrs{last_s}", True)
 
 
 def _print_dps_consistency_table(symbols: list[str]) -> dict[str, tuple[str, bool]]:
@@ -2082,6 +2517,7 @@ def _print_dps_consistency_table(symbols: list[str]) -> dict[str, tuple[str, boo
         rows.append(
             {
                 "symbol": sym,
+                "name": _resolve_company_name(sym)[:36],
                 "years_paid": f"{hist.get('years_with_dividends', 0)}/{hist.get('lookback_years', 5)}",
                 "fy_latest": y1,
                 "fy_prior": y2,
@@ -2091,8 +2527,11 @@ def _print_dps_consistency_table(symbols: list[str]) -> dict[str, tuple[str, boo
     show = pd.DataFrame(rows)
     print(show.to_string(index=False))
     print(
-        "\n  Regular payer heuristic: cash dividends in at least "
-        f"{_DPS_LOOKBACK_YEARS - 1} of last {_DPS_LOOKBACK_YEARS} calendar years."
+        "\n  Tiers: regular = 4-5/5 yrs paid · mixed = 2-3/5 (kept on balanced filter) · "
+        "weak = 1/5 · none = 0/5 · yield-only = no history, screener yield."
+    )
+    print(
+        "  Balanced filter (default): drops weak/none only. Strict: 4/5+ only. Lenient: 0/5 only."
     )
     if not _yahoo_dividends_enabled():
         print("  (PSX_SIP_NO_YAHOO=1 — Yahoo Rs/sh amounts skipped.)")
@@ -2171,7 +2610,12 @@ def _index_constituent_weights(index_name: str) -> pd.DataFrame:
     if raw is None or raw.empty or "symbol" not in raw.columns:
         return pd.DataFrame(columns=["symbol", "idx_weight"])
     out = raw[["symbol"]].copy()
-    out["symbol"] = out["symbol"].astype(str).str.upper()
+    out["symbol"] = (
+        out["symbol"]
+        .astype(str)
+        .str.upper()
+        .map(_tradable_equity_symbol)
+    )
     out["idx_weight"] = pd.to_numeric(raw.get("idx_weight"), errors="coerce").fillna(0.0)
     return out.groupby("symbol", as_index=False)["idx_weight"].max()
 
@@ -2233,8 +2677,9 @@ Dividend-income checklist (research summary — not advice):
     but sector shocks (rates, oil, policy) cluster.
   • PSX publishes PSXDIV20 — top dividend names by yield + history; good research universe.
   • Reinvest dividends for compounding; review holdings at least quarterly.
-  • This planner scores yield + blue-chip index weight + 1y price — verify fundamentals
-    on PSX company pages before you buy.
+  • For dividend SIPs, DPS history + yield beat EPS trends unless you opt into strict EPS.
+    Regular payers (e.g. banks) may show EPS dips while still paying dividends.
+  • Verify payout safety on PSX company pages before you buy.
 
 Suggested planner knobs for income focus:
   Pool: PSXDIV20 (or KSE100+KSE30 for a wider list)
@@ -2720,14 +3165,75 @@ def _mf_equity_weight_map(fund: dict) -> dict[str, float]:
     """FMR top-10 weights renormalized to 100% (for a DIY stock basket)."""
     weights: dict[str, float] = {}
     for h in fund.get("holdings") or []:
-        sym = str(h.get("symbol", "")).upper()
+        sym = _mf_fmr_symbol(
+            str(h.get("symbol", "")),
+            str(h.get("company_name", "")),
+        )
         if not sym:
             continue
-        weights[sym] = float(h.get("weight_pct", 0.0) or 0.0)
-    total = sum(weights.values())
-    if total <= 0:
-        return weights
-    return {s: w / total * 100.0 for s, w in weights.items()}
+        tradable = _tradable_equity_symbol(sym)
+        weights[tradable] = weights.get(tradable, 0.0) + float(
+            h.get("weight_pct", 0.0) or 0.0
+        )
+    return _canonicalize_weight_map(weights, renormalize=True)
+
+
+_screener_symbol_set_cache: set[str] | None = None
+
+
+def _screener_symbol_set() -> set[str]:
+    global _screener_symbol_set_cache
+    if _screener_symbol_set_cache is None:
+        scr = fetch_screener()
+        if scr.empty or "symbol" not in scr.columns:
+            _screener_symbol_set_cache = set()
+        else:
+            _screener_symbol_set_cache = set(
+                scr["symbol"].astype(str).str.upper()
+            )
+    return _screener_symbol_set_cache
+
+
+def _mf_fmr_symbol(raw_symbol: str, company_name: str = "") -> str:
+    """Fix common FMR typos before mapping to tradable PSX tickers."""
+    sym = str(raw_symbol or "").upper().strip()
+    name_l = str(company_name or "").lower()
+    if sym == "ABL" and "abbott" in name_l:
+        return "ABOT"
+    return sym
+
+
+def _tradable_equity_symbol(sym: str) -> str:
+    """
+    Map index/FMR tickers to a PSX screener symbol.
+    PSX index rows often use *XD suffixes while funds use the plain ticker.
+    """
+    sym = str(sym or "").upper().strip()
+    if not sym:
+        return sym
+    scr_syms = _screener_symbol_set()
+    if sym in scr_syms:
+        return sym
+    xd = sym + "XD"
+    if xd in scr_syms:
+        return xd
+    if sym.endswith("XD"):
+        base = sym[:-2]
+        if base in scr_syms:
+            return base
+    return sym
+
+
+def _canonicalize_weight_map(
+    weights: dict[str, float], *, renormalize: bool = True
+) -> dict[str, float]:
+    merged: dict[str, float] = {}
+    for sym, w in weights.items():
+        tradable = _tradable_equity_symbol(sym)
+        merged[tradable] = merged.get(tradable, 0.0) + float(w or 0.0)
+    if renormalize:
+        return _renormalize_weights(merged)
+    return merged
 
 
 def _psxdiv20_weight_map() -> dict[str, float]:
@@ -2738,11 +3244,35 @@ def _psxdiv20_weight_map() -> dict[str, float]:
     for _, row in raw.iterrows():
         sym = str(row["symbol"]).upper()
         w = float(pd.to_numeric(row.get("idx_weight"), errors="coerce") or 0.0)
-        out[sym] = max(out.get(sym, 0.0), w)
+        tradable = _tradable_equity_symbol(sym)
+        out[tradable] = max(out.get(tradable, 0.0), w)
     total = sum(out.values())
     if total <= 0:
         return out
-    return {s: w / total * 100.0 for s, w in out.items()}
+    raw_map = {s: w / total * 100.0 for s, w in out.items()}
+    return _canonicalize_weight_map(raw_map, renormalize=True)
+
+
+def _blue_chip_index_weight_map() -> dict[str, float]:
+    """KSE100 + KSE30 index weights (tradable symbols) for blue-chip ranking."""
+    combined: dict[str, float] = {}
+    for index_name in ("KSE100", "KSE30"):
+        raw = fetch_indices(index_name)
+        if raw is None or raw.empty:
+            continue
+        for _, row in raw.iterrows():
+            sym = _tradable_equity_symbol(str(row["symbol"]).upper())
+            w = float(pd.to_numeric(row.get("idx_weight"), errors="coerce") or 0.0)
+            combined[sym] = max(combined.get(sym, 0.0), w)
+    total = sum(combined.values())
+    if total <= 0:
+        return combined
+    return {s: w / total * 100.0 for s, w in combined.items()}
+
+
+def _listed_in_is_blue_chip(listed_in: str) -> bool:
+    li = str(listed_in or "").upper()
+    return "KSE100" in li or "KSE30" in li
 
 
 def _renormalize_weights(weights: dict[str, float]) -> dict[str, float]:
@@ -2753,14 +3283,23 @@ def _renormalize_weights(weights: dict[str, float]) -> dict[str, float]:
 
 
 def _kmi30_symbol_set() -> set[str]:
-    """Shariah index membership proxy (PSX screener listed_in)."""
+    """Shariah filter: KMI30 index membership only (PSX screener listed_in)."""
+    return _shariah_symbol_set("kmi30")
+
+
+def _shariah_symbol_set(pool: str = "kmi30") -> set[str]:
+    """Shariah-listed symbols from PSX screener (KMI30 or wider KMI All Share)."""
     scr = fetch_screener()
     if scr.empty or "listed_in" not in scr.columns:
         return set()
+    wide = str(pool).strip().lower() in ("kmi_all", "all", "allshare", "2", "b")
     found: set[str] = set()
     for _, row in scr.iterrows():
         li = str(row.get("listed_in", "")).upper()
-        if "KMI30" in li or "KMIALLSHR" in li:
+        if wide:
+            if "KMI30" in li or "KMIALLSHR" in li:
+                found.add(str(row["symbol"]).upper())
+        elif "KMI30" in li:
             found.add(str(row["symbol"]).upper())
     return found
 
@@ -2768,23 +3307,37 @@ def _kmi30_symbol_set() -> set[str]:
 def _apply_shariah_filter_to_div20(
     div20: dict[str, float], *, enabled: bool
 ) -> dict[str, float]:
-    if not enabled or not div20:
-        return div20
-    kmi = _kmi30_symbol_set()
+    return _apply_shariah_filter_weights(div20, enabled=enabled, context="PSXDIV20")
+
+
+def _apply_shariah_filter_weights(
+    weights: dict[str, float],
+    *,
+    enabled: bool,
+    context: str = "basket",
+    shariah_pool: str = "kmi30",
+    quiet: bool = False,
+) -> dict[str, float]:
+    if not enabled or not weights:
+        return weights
+    kmi = _shariah_symbol_set(shariah_pool)
+    pool_label = "KMI All Share" if shariah_pool != "kmi30" else "KMI30"
     if not kmi:
-        print("  Note: could not load KMI list — PSXDIV20 unfiltered.")
-        return div20
-    filtered = {s: w for s, w in div20.items() if s in kmi}
-    dropped = set(div20.keys()) - set(filtered.keys())
-    if dropped:
+        if not quiet:
+            print(f"  Note: could not load {pool_label} list — {context} unfiltered.")
+        return weights
+    filtered = {s: w for s, w in weights.items() if s in kmi}
+    dropped = set(weights.keys()) - set(filtered.keys())
+    if dropped and not quiet:
         print(
-            f"  Shariah filter: dropped {len(dropped)} PSXDIV20 name(s) "
-            f"not on KMI30 (e.g. {', '.join(sorted(dropped)[:6])}"
+            f"  Shariah filter ({pool_label}): dropped {len(dropped)} name(s) from {context} "
+            f"(e.g. {', '.join(sorted(dropped)[:6])}"
             + (" …" if len(dropped) > 6 else "")
             + ")."
         )
     if not filtered:
-        print("  No PSXDIV20 names left after Shariah filter — using fund only.")
+        if not quiet:
+            print(f"  No names left in {context} after Shariah filter.")
         return {}
     return _renormalize_weights(filtered)
 
@@ -2794,6 +3347,8 @@ def _blend_weight_maps(
     div20: dict[str, float],
     mode: str,
 ) -> dict[str, float]:
+    mf = _canonicalize_weight_map(mf, renormalize=False)
+    div20 = _canonicalize_weight_map(div20, renormalize=False)
     if mode == "mf":
         return _renormalize_weights(mf)
     if mode == "div20":
@@ -2835,7 +3390,7 @@ def _dataframe_from_weight_map(
             names[s] = str(row.get("name", s))
             sectors[s] = str(row.get("sector_name", "") or "UNKNOWN")
 
-    scr, price_col = _screener_price_frame()
+    scr, price_col = _market_price_index()
     rows: list[dict] = []
     for sym, wt in sorted(weights.items(), key=lambda kv: kv[1], reverse=True):
         price, _src = _resolve_live_price(sym, scr, price_col)
@@ -2845,8 +3400,10 @@ def _dataframe_from_weight_map(
         rows.append(
             {
                 "symbol": sym,
-                "name": names.get(sym, sym),
-                "sector_name": sectors.get(sym, "UNKNOWN"),
+                "name": _resolve_company_name(sym),
+                "sector_name": _resolve_sector_name(
+                    sym, sectors.get(sym, "UNKNOWN")
+                ),
                 "price": float(price),
                 "idx_weight": float(wt),
             }
@@ -2976,6 +3533,10 @@ def run_dividend_mf_psxdiv20_sip_flow() -> None:
             print("  Falling back to mutual fund top-10 only.")
             blend_mode = "mf"
     target_w = _blend_weight_maps(mf_w, div_w, blend_mode)
+    if shariah_fund:
+        target_w = _apply_shariah_filter_weights(
+            target_w, enabled=True, context="merged basket"
+        )
     if not target_w:
         print("  Empty basket — try option 1 (full fund top-10) or 3 (combined).")
         return
@@ -3003,9 +3564,22 @@ def run_dividend_mf_psxdiv20_sip_flow() -> None:
     show = show.rename(columns={"idx_weight": "target_weight"})
     print(show.to_string(index=False))
 
-    confirm = prompt("\nUse this basket for SIP planning? [Y/n]: ").lower()
-    if confirm in ("n", "no"):
-        print("  Cancelled.")
+    shariah_fund = _fund_is_shariah(fund)
+    df = prompt_dividend_basket_use_or_replace(
+        df,
+        title=title,
+        replace_ctx={
+            "shariah_only": shariah_fund,
+            "shariah_pool": "kmi_all" if shariah_fund else "kmi30",
+            "min_div_yield": 0.0,
+            "max_pe": None,
+            "exclude_eps": False,
+            "dps_income_filter": "off",
+            "weight_mode": "index",
+            "prefer_blue_chip": True,
+        },
+    )
+    if df is None:
         return
 
     basket_id = re.sub(r"[^\w\-]+", "_", f"div_{blend_mode}_{mf_label}")[:36]
@@ -3016,6 +3590,7 @@ def run_dividend_mf_psxdiv20_sip_flow() -> None:
         "parsed_holdings": [],
         "missing_price_symbols": [],
         "dividend_blend": blend_mode,
+        "sip_profile": "dividend_basket",
     }
     _run_benchmark_sip_flow(
         df,
@@ -3078,26 +3653,1037 @@ def run_dividend_reference_composition_flow() -> None:
         )
 
 
+def _load_dividend_pool_from_holdings() -> set[str]:
+    env_path = os.environ.get("PSX_SIP_HOLDINGS", "").strip()
+    if env_path:
+        path = os.path.expanduser(env_path)
+        print(f"\n  Using PSX_SIP_HOLDINGS: {path}")
+    else:
+        print("\n  Load holdings to screen (snapshot or plan CSV).")
+        path = prompt_existing_csv_path("holdings")
+    if not os.path.isfile(path):
+        print(f"  File not found: {path}")
+        return set()
+    prior, _, _ = _load_prior_shares_from_any_csv(path, "custom", "holdings")
+    return {
+        _tradable_equity_symbol(s) for s in prior.keys() if prior.get(s, 0) > 0
+    }
+
+
+def _dividend_screen_candidate_weights(
+    *,
+    universe_mode: str,
+    shariah_only: bool,
+    shariah_pool: str,
+    holdings_symbols: set[str] | None,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """
+    Candidate symbols -> index reference weight (0 if not in PSXDIV20).
+    Second dict is full PSXDIV20 (tradable, optionally KMI30-filtered) for weight lookup.
+    """
+    div_w = _psxdiv20_weight_map()
+    if not div_w:
+        print("  Could not load PSXDIV20.")
+        sys.exit(1)
+    div_ref = div_w
+    if shariah_only:
+        div_ref = _apply_shariah_filter_weights(
+            div_w, enabled=True, context="PSXDIV20", shariah_pool=shariah_pool
+        ) or {}
+    kmi = _shariah_symbol_set(shariah_pool) if shariah_only else None
+
+    if holdings_symbols:
+        tradable = {_tradable_equity_symbol(s) for s in holdings_symbols}
+        weights: dict[str, float] = {}
+        for sym in sorted(tradable):
+            if shariah_only and kmi is not None and sym not in kmi:
+                continue
+            weights[sym] = float(div_ref.get(sym, 0.0))
+        if not weights:
+            print("  No holdings left after Shariah (KMI30) filter.")
+            sys.exit(1)
+        return weights, div_ref
+
+    if universe_mode == "div20_only":
+        if not div_ref:
+            sys.exit(1)
+        return dict(div_ref), div_ref
+
+    scr = _build_screener_enriched()
+    if universe_mode == "kmi30_screen":
+        weights = dict(div_ref)
+        for _, row in scr.iterrows():
+            sym = str(row["symbol"]).upper()
+            if sym in weights:
+                continue
+            if shariah_only and kmi is not None and sym not in kmi:
+                continue
+            dy = float(pd.to_numeric(row.get("dividend_yield"), errors="coerce") or 0.0)
+            if dy <= 0:
+                continue
+            weights[sym] = 0.0
+        return weights, div_ref
+
+    # div20_expand — PSXDIV20 first; backfill from screener in basket builder
+    if not div_ref:
+        sys.exit(1)
+    return dict(div_ref), div_ref
+
+
+def _build_psxdiv20_screened_basket(
+    *,
+    target_count: int,
+    shariah_only: bool,
+    shariah_pool: str,
+    pool_symbols: set[str] | None,
+    universe_mode: str,
+    min_div_yield: float,
+    max_pe: float | None,
+    exclude_eps_decliners: bool,
+    dps_income_filter: str,
+    weight_mode: str,
+    prefer_blue_chip: bool = True,
+    max_per_sector: int = CUSTOM_BASKET_MAX_PER_SECTOR,
+) -> pd.DataFrame:
+    candidates, div_ref = _dividend_screen_candidate_weights(
+        universe_mode=universe_mode,
+        shariah_only=shariah_only,
+        shariah_pool=shariah_pool,
+        holdings_symbols=pool_symbols,
+    )
+    expand_universe = universe_mode in ("div20_expand", "kmi30_screen") and not pool_symbols
+
+    scr = _build_screener_enriched()
+    scr_by = {str(r["symbol"]).upper(): r for _, r in scr.iterrows()}
+    kmi = _shariah_symbol_set(shariah_pool) if shariah_only else None
+    blue_chip_w = _blue_chip_index_weight_map()
+
+    def _screener_yield(sym: str) -> float:
+        row = scr_by.get(sym)
+        if row is None:
+            return 0.0
+        return float(pd.to_numeric(row.get("dividend_yield"), errors="coerce") or 0.0)
+
+    def _blue_chip_rank(sym: str) -> float:
+        row = scr_by.get(sym)
+        li = str(row.get("listed_in", "")) if row is not None else ""
+        bc = float(blue_chip_w.get(sym, 0.0))
+        if _listed_in_is_blue_chip(li):
+            bc = max(bc, 0.01)
+        return bc
+
+    def _candidate_sort_key(sym: str, idx_w: float) -> tuple[float, ...]:
+        dy = _screener_yield(sym)
+        bc = _blue_chip_rank(sym)
+        tier = _dps_income_tier(_dps_history(sym))
+        dps_score = _dps_tier_rank_score(tier)
+        if weight_mode == "yield":
+            return (dy, dps_score, bc, idx_w)
+        return (idx_w, dps_score, dy, bc)
+
+    ranked = sorted(
+        candidates.items(),
+        key=lambda kv: _candidate_sort_key(kv[0], kv[1]),
+        reverse=True,
+    )
+    picked: list[tuple[str, float, pd.Series]] = []
+    skipped: list[str] = []
+    sector_counts: dict[str, int] = {}
+
+    def _passes_fundamentals(sym: str) -> tuple[bool, pd.Series | None]:
+        row = scr_by.get(sym)
+        if row is None:
+            skipped.append(f"{sym} (not on screener)")
+            return False, None
+        dy = float(pd.to_numeric(row.get("dividend_yield"), errors="coerce") or 0.0)
+        if min_div_yield > 0 and dy < min_div_yield:
+            skipped.append(f"{sym} (yield {dy:.2f}% < {min_div_yield:g}%)")
+            return False, row
+        if max_pe is not None:
+            pe = pd.to_numeric(row.get("pe_ratio"), errors="coerce")
+            if pd.notna(pe) and float(pe) > max_pe:
+                skipped.append(f"{sym} (P/E {float(pe):.1f} > {max_pe:g})")
+                return False, row
+        if dps_income_filter != "off":
+            hist = _dps_history(sym)
+            tier = _dps_income_tier(hist)
+            if _dps_tier_excluded(tier, dps_income_filter):
+                skipped.append(f"{sym} (DPS {tier}, filter={dps_income_filter})")
+                return False, row
+        if exclude_eps_decliners:
+            eps_vals = _company_annual_eps_values(sym)
+            _note, exclude = _describe_eps_trend(eps_vals)
+            if exclude:
+                skipped.append(f"{sym} (EPS trend — optional strict filter)")
+                return False, row
+        return True, row
+
+    def _try_add(sym: str, idx_w: float) -> bool:
+        if len(picked) >= target_count:
+            return False
+        if any(p[0] == sym for p in picked):
+            return False
+        ok, row = _passes_fundamentals(sym)
+        if not ok or row is None:
+            return False
+        sec = _resolve_sector_name(sym, str(row.get("sector_name", "UNKNOWN")))
+        if sector_counts.get(sec, 0) >= max_per_sector:
+            skipped.append(f"{sym} (sector cap {sec})")
+            return False
+        sector_counts[sec] = sector_counts.get(sec, 0) + 1
+        picked.append((sym, idx_w, row))
+        return True
+
+    for sym, wt in ranked:
+        if len(picked) >= target_count:
+            break
+        _try_add(sym, wt)
+
+    if expand_universe and len(picked) < target_count:
+        backfill: list[tuple[str, float]] = []
+        for _, row in scr.iterrows():
+            sym = str(row["symbol"]).upper()
+            if sym in candidates and candidates.get(sym, 0) > 0:
+                continue
+            if shariah_only and kmi is not None and sym not in kmi:
+                continue
+            dy = float(pd.to_numeric(row.get("dividend_yield"), errors="coerce") or 0.0)
+            if min_div_yield > 0 and dy < min_div_yield:
+                continue
+            backfill.append((sym, dy))
+        def _backfill_sort_key(item: tuple[str, float]) -> tuple[int, float, float]:
+            sym, dy = item
+            row = scr_by.get(sym)
+            li = str(row.get("listed_in", "")) if row is not None else ""
+            bc = _blue_chip_rank(sym)
+            is_blue = bc > 0 or _listed_in_is_blue_chip(li)
+            tier = 0 if (not prefer_blue_chip or is_blue) else 1
+            return (tier, -bc, -dy)
+
+        backfill.sort(key=_backfill_sort_key)
+        added = 0
+        added_non_blue = 0
+
+        def _is_blue_chip(sym: str) -> bool:
+            row = scr_by.get(sym)
+            li = str(row.get("listed_in", "")) if row is not None else ""
+            return _blue_chip_rank(sym) > 0 or _listed_in_is_blue_chip(li)
+
+        def _backfill_one(sym: str) -> None:
+            nonlocal added, added_non_blue
+            is_blue = _is_blue_chip(sym)
+            if _try_add(sym, float(div_ref.get(sym, 0.0))):
+                added += 1
+                if not is_blue:
+                    added_non_blue += 1
+
+        if prefer_blue_chip:
+            for sym, _dy in backfill:
+                if len(picked) >= target_count:
+                    break
+                if not _is_blue_chip(sym):
+                    continue
+                _backfill_one(sym)
+        for sym, _dy in backfill:
+            if len(picked) >= target_count:
+                break
+            if prefer_blue_chip and _is_blue_chip(sym):
+                continue
+            _backfill_one(sym)
+        if added:
+            msg = (
+                f"  Added {added} name(s) outside PSXDIV20 to reach your target "
+                f"(dividend backfill; KSE100/KSE30 preferred when enabled)."
+            )
+            if prefer_blue_chip and added_non_blue:
+                msg += f" {added_non_blue} not in KSE100/KSE30."
+            print(msg)
+
+    if not picked:
+        print("  No names passed your filters.")
+        if skipped:
+            print("  Skipped examples: " + ", ".join(skipped[:10]))
+        sys.exit(1)
+
+    if len(picked) < target_count:
+        print(
+            f"  Note: only {len(picked)} name(s) passed filters "
+            f"(asked for {target_count}). "
+            "Try lower min yield, universe option 3, or turn off EPS/DPS skips."
+        )
+
+    rows: list[dict] = []
+    for sym, wt, row in picked:
+        dy = float(row.get("dividend_yield", 0.0) or 0.0)
+        pe = pd.to_numeric(row.get("pe_ratio"), errors="coerce")
+        ref_w = float(div_ref.get(sym, wt))
+        if weight_mode == "index":
+            alloc_w = ref_w if ref_w > 0 else max(dy, 0.01)
+        else:
+            alloc_w = max(dy, 0.01)
+        rows.append(
+            {
+                "symbol": sym,
+                "name": _resolve_company_name(sym),
+                "sector_name": _resolve_sector_name(
+                    sym, str(row.get("sector_name", "UNKNOWN"))
+                ),
+                "price": float(row.get("price") or 0.0),
+                "idx_weight": alloc_w,
+                "dividend_yield": dy,
+                "pe_ratio": float(pe) if pd.notna(pe) else None,
+                "in_psxdiv20": sym in div_ref,
+            }
+        )
+    df = pd.DataFrame(rows)
+    total = df["idx_weight"].sum()
+    if total <= 0:
+        df["idx_weight"] = 100.0 / len(df)
+    else:
+        df["idx_weight"] = df["idx_weight"] / total * 100.0
+    return df.sort_values("idx_weight", ascending=False).reset_index(drop=True)
+
+
+def _dividend_basket_div_ref(
+    *, shariah_only: bool, shariah_pool: str, quiet: bool = False
+) -> dict[str, float]:
+    div_w = _psxdiv20_weight_map()
+    if shariah_only:
+        filtered = _apply_shariah_filter_weights(
+            div_w,
+            enabled=True,
+            context="PSXDIV20",
+            shariah_pool=shariah_pool,
+            quiet=quiet,
+        )
+        return filtered or {}
+    return div_w
+
+
+def _renormalize_dividend_basket_df(
+    df: pd.DataFrame,
+    *,
+    weight_mode: str,
+    div_ref: dict[str, float],
+) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    if weight_mode == "yield":
+        out["idx_weight"] = pd.to_numeric(
+            out["dividend_yield"], errors="coerce"
+        ).fillna(0.01).clip(lower=0.01)
+    else:
+        weights: list[float] = []
+        for sym in out["symbol"].astype(str).str.upper():
+            ref = float(div_ref.get(sym, 0.0) or 0.0)
+            if ref <= 0:
+                row = _screener_row(sym)
+                ref = 0.01
+                if row is not None:
+                    ref = max(
+                        float(
+                            pd.to_numeric(row.get("dividend_yield"), errors="coerce")
+                            or 0.01
+                        ),
+                        0.01,
+                    )
+            weights.append(ref)
+        out["idx_weight"] = weights
+    total = float(out["idx_weight"].sum())
+    if total <= 0:
+        out["idx_weight"] = 100.0 / len(out)
+    else:
+        out["idx_weight"] = out["idx_weight"] / total * 100.0
+    return out.sort_values("idx_weight", ascending=False).reset_index(drop=True)
+
+
+def _dividend_screener_row_to_basket_row(
+    sym: str,
+    *,
+    div_ref: dict[str, float],
+    weight_mode: str,
+) -> dict | None:
+    sym = _tradable_equity_symbol(sym.upper())
+    row = _screener_row(sym)
+    if row is None:
+        return None
+    price = float(pd.to_numeric(row.get("price"), errors="coerce") or 0.0)
+    if price <= 0:
+        return None
+    dy = float(pd.to_numeric(row.get("dividend_yield"), errors="coerce") or 0.0)
+    pe = pd.to_numeric(row.get("pe_ratio"), errors="coerce")
+    ref_w = float(div_ref.get(sym, 0.0) or 0.0)
+    if weight_mode == "index":
+        alloc_w = ref_w if ref_w > 0 else max(dy, 0.01)
+    else:
+        alloc_w = max(dy, 0.01)
+    return {
+        "symbol": sym,
+        "name": _resolve_company_name(sym),
+        "sector_name": _resolve_sector_name(sym, str(row.get("sector_name", "UNKNOWN"))),
+        "price": price,
+        "idx_weight": alloc_w,
+        "dividend_yield": dy,
+        "pe_ratio": float(pe) if pd.notna(pe) else None,
+        "in_psxdiv20": sym in div_ref,
+    }
+
+
+def _dividend_replacement_candidates(
+    held_symbols: set[str],
+    *,
+    shariah_only: bool,
+    shariah_pool: str,
+    min_div_yield: float,
+    max_pe: float | None,
+    exclude_eps: bool,
+    dps_income_filter: str,
+    prefer_blue_chip: bool,
+    limit: int = 12,
+    div_ref: dict[str, float] | None = None,
+) -> pd.DataFrame:
+    """Fast shortlist: screener pre-filter, then DPS/EPS only on top ~40 by yield."""
+    if div_ref is None:
+        div_ref = _dividend_basket_div_ref(
+            shariah_only=shariah_only, shariah_pool=shariah_pool, quiet=True
+        )
+    scr = _build_screener_enriched()
+    kmi = _shariah_symbol_set(shariah_pool) if shariah_only else None
+    blue_chip_w = _blue_chip_index_weight_map()
+    prelim: list[dict] = []
+    for _, row in scr.iterrows():
+        sym = str(row["symbol"]).upper()
+        if sym in held_symbols:
+            continue
+        if shariah_only and kmi is not None and sym not in kmi:
+            continue
+        dy = float(pd.to_numeric(row.get("dividend_yield"), errors="coerce") or 0.0)
+        if min_div_yield > 0 and dy < min_div_yield:
+            continue
+        pe = pd.to_numeric(row.get("pe_ratio"), errors="coerce")
+        if max_pe is not None and pd.notna(pe) and float(pe) > max_pe:
+            continue
+        li = str(row.get("listed_in", ""))
+        bc = float(blue_chip_w.get(sym, 0.0))
+        if _listed_in_is_blue_chip(li):
+            bc = max(bc, 0.01)
+        prelim.append(
+            {
+                "symbol": sym,
+                "name": _resolve_company_name(sym),
+                "dividend_yield": dy,
+                "pe_ratio": float(pe) if pd.notna(pe) else None,
+                "blue_chip_rank": bc,
+                "in_psxdiv20": sym in div_ref,
+            }
+        )
+    if not prelim:
+        return pd.DataFrame()
+    pre_df = pd.DataFrame(prelim)
+    if prefer_blue_chip:
+        pre_df = pre_df.sort_values(
+            ["blue_chip_rank", "dividend_yield"], ascending=[False, False]
+        )
+    else:
+        pre_df = pre_df.sort_values("dividend_yield", ascending=False)
+    shortlist = pre_df.head(40)
+
+    picked: list[dict] = []
+    need_eps = exclude_eps
+    need_dps = dps_income_filter != "off"
+    n = len(shortlist)
+    if need_eps or need_dps:
+        print(
+            f"  Checking DPS/EPS on top {n} candidates (not whole market)…",
+            flush=True,
+        )
+    for i, (_, row) in enumerate(shortlist.iterrows(), start=1):
+        sym = str(row["symbol"]).upper()
+        if need_eps or need_dps:
+            if i == 1 or i == n or i % 5 == 0:
+                print(f"    … {i}/{n}", flush=True)
+        if exclude_eps:
+            _note, exclude = _describe_eps_trend(_company_annual_eps_values(sym))
+            if exclude:
+                continue
+        if dps_income_filter != "off":
+            tier = _dps_income_tier(_dps_history(sym))
+            if _dps_tier_excluded(tier, dps_income_filter):
+                continue
+        picked.append(row.to_dict())
+        if len(picked) >= limit:
+            break
+    if not picked:
+        return pd.DataFrame()
+    return pd.DataFrame(picked).reset_index(drop=True)
+
+
+def _parse_basket_drop_symbols(raw: str, basket_symbols: list[str]) -> list[str]:
+    held = set(basket_symbols)
+    out: list[str] = []
+    for part in raw.replace(";", ",").split(","):
+        token = part.strip().upper()
+        if not token:
+            continue
+        if token.isdigit():
+            idx = int(token) - 1
+            if 0 <= idx < len(basket_symbols):
+                out.append(basket_symbols[idx])
+            continue
+        sym = _tradable_equity_symbol(token)
+        if sym in held:
+            out.append(sym)
+    # preserve order, unique
+    seen: set[str] = set()
+    unique: list[str] = []
+    for s in out:
+        if s not in seen:
+            seen.add(s)
+            unique.append(s)
+    return unique
+
+
+def _parse_replacement_picks(
+    raw: str, cands: pd.DataFrame, count: int
+) -> list[str]:
+    """Resolve comma-sep symbols or 1-based indices into replacement tickers."""
+    text = raw.strip()
+    if not text:
+        return []
+    parts = [p.strip() for p in text.replace(";", ",").split(",") if p.strip()]
+    out: list[str] = []
+    cand_syms = [
+        str(cands.iloc[j]["symbol"]).upper() for j in range(len(cands))
+    ]
+    for part in parts:
+        if part.isdigit():
+            j = int(part) - 1
+            if 0 <= j < len(cand_syms):
+                out.append(cand_syms[j])
+            continue
+        out.append(_tradable_equity_symbol(part.upper()))
+    return out[:count]
+
+
+def _print_dividend_target_basket_table(df: pd.DataFrame, *, title: str) -> None:
+    print(f"\n--- Target basket: {title} ({len(df)} stocks) ---")
+    if df.empty:
+        print("  (empty)")
+        return
+    for line_no, (_, row) in enumerate(df.iterrows(), start=1):
+        print(
+            f"  {line_no:>2}. {str(row['symbol']):<8} "
+            f"{str(row.get('name', ''))[:34]:<34} "
+            f"{float(row.get('idx_weight', 0)):.2f}%"
+        )
+    show_cols = ["symbol", "name", "sector_name", "idx_weight", "dividend_yield"]
+    if "pe_ratio" in df.columns:
+        show_cols.append("pe_ratio")
+    if "in_psxdiv20" in df.columns:
+        show_cols.append("in_psxdiv20")
+    show = df[show_cols].copy()
+    show["idx_weight"] = show["idx_weight"].map(lambda w: f"{w:.2f}%")
+    if "dividend_yield" in show.columns:
+        show["dividend_yield"] = show["dividend_yield"].map(
+            lambda v: f"{float(v):.2f}%"
+        )
+    if "pe_ratio" in show.columns:
+        show["pe_ratio"] = show["pe_ratio"].map(
+            lambda v: f"{v:.1f}" if v is not None and pd.notna(v) else "—"
+        )
+    if "in_psxdiv20" in show.columns:
+        show["in_psxdiv20"] = show["in_psxdiv20"].map(
+            lambda v: "index" if v else "backfill"
+        )
+    show = show.rename(
+        columns={
+            "idx_weight": "target_weight",
+            "pe_ratio": "P/E",
+            "sector_name": "sector",
+            "in_psxdiv20": "psxdiv20",
+        }
+    )
+    print()
+    print(show.to_string(index=False))
+
+
+def _print_dividend_screen_symbol_diagnosis(
+    symbols: list[str],
+    *,
+    picked_symbols: set[str],
+    shariah_only: bool,
+    shariah_pool: str,
+    min_div_yield: float,
+    max_pe: float | None,
+    exclude_eps: bool,
+    dps_income_filter: str,
+    target_count: int,
+    universe_mode: str,
+) -> None:
+    """Explain which filter removed each symbol (same rules as screened basket build)."""
+    if not symbols:
+        return
+    div_w = _psxdiv20_weight_map()
+    div_ref = _dividend_basket_div_ref(
+        shariah_only=shariah_only, shariah_pool=shariah_pool, quiet=True
+    )
+    kmi = _shariah_symbol_set(shariah_pool) if shariah_only else None
+    ranked = sorted(div_ref.items(), key=lambda kv: kv[1], reverse=True)
+    rank_map = {s: i + 1 for i, (s, _) in enumerate(ranked)}
+
+    print("\n  --- Why name(s) missed your basket ---")
+    for raw in symbols:
+        sym = _tradable_equity_symbol(raw.upper())
+        name = _resolve_company_name(sym)
+        print(f"\n  {raw} → {sym}  ({name})")
+        if sym in picked_symbols:
+            print("    Already in your basket.")
+            continue
+        row = _screener_row(sym)
+        if row is None:
+            print("    Blocked: not on PSX screener (no price/yield).")
+            continue
+        reasons: list[str] = []
+        in_raw = sym in div_w
+        in_ref = sym in div_ref
+        if in_ref:
+            print(
+                f"    PSXDIV20: yes (#{rank_map.get(sym, '?')} of {len(ranked)} "
+                f"by index weight, {div_ref.get(sym, 0):.2f}%)"
+            )
+        elif in_raw and shariah_only:
+            print("    PSXDIV20: in index but removed by Shariah filter (not KMI list).")
+            reasons.append("Shariah index filter")
+        else:
+            print("    PSXDIV20: not an index member — needs a backfill slot if filters pass.")
+
+        if shariah_only and kmi is not None and sym not in kmi:
+            reasons.append("not on selected Shariah list (KMI30 / KMI All Share)")
+
+        dy = float(pd.to_numeric(row.get("dividend_yield"), errors="coerce") or 0.0)
+        if min_div_yield > 0 and dy < min_div_yield:
+            reasons.append(f"yield {dy:.2f}% < min {min_div_yield:g}%")
+        else:
+            print(f"    Yield: {dy:.2f}% (passes min {min_div_yield:g}%)")
+
+        pe = pd.to_numeric(row.get("pe_ratio"), errors="coerce")
+        if max_pe is not None and pd.notna(pe) and float(pe) > max_pe:
+            reasons.append(f"P/E {float(pe):.1f} > cap {max_pe:g}")
+
+        if exclude_eps:
+            _eps_note, eps_ex = _describe_eps_trend(_company_annual_eps_values(sym))
+            if eps_ex:
+                reasons.append(f"EPS filter ({_eps_note})")
+            else:
+                print(f"    EPS: {_eps_note}")
+
+        if dps_income_filter != "off":
+            tier = _dps_income_tier(_dps_history(sym))
+            dps_note, _ = _describe_dps_regularity(_dps_history(sym))
+            if _dps_tier_excluded(tier, dps_income_filter):
+                reasons.append(f"DPS filter ({dps_note})")
+            else:
+                print(f"    DPS: {dps_note}")
+
+        if universe_mode == "div20_only" and not in_ref:
+            reasons.append("universe = PSXDIV20 only (not in index)")
+
+        if not reasons and not in_ref:
+            # backfill competition
+            held_yield = []
+            for s in picked_symbols:
+                r = _screener_row(s)
+                if r is not None:
+                    held_yield.append(
+                        (
+                            s,
+                            float(
+                                pd.to_numeric(r.get("dividend_yield"), errors="coerce")
+                                or 0
+                            ),
+                        )
+                    )
+            held_yield.sort(key=lambda t: t[1])
+            print(
+                "    Filters pass, but not chosen: only "
+                f"{target_count} slots; PSXDIV20 names fill first, then "
+                "backfill by blue-chip + yield."
+            )
+            if held_yield:
+                lo = held_yield[0]
+                print(
+                    f"    Lowest-yield pick in basket: {lo[0]} at {lo[1]:.2f}% "
+                    f"(you: {dy:.2f}%)."
+                )
+        elif reasons:
+            print("    Blocked by: " + "; ".join(reasons))
+        elif in_ref and rank_map.get(sym, 99) > target_count:
+            print(
+                f"    Index rank #{rank_map[sym]} — builder fills by index weight "
+                f"order until {target_count} names pass filters (others can bump this)."
+            )
+
+    print(
+        "\n  Tip: with default dividend-first settings, EPS is not filtered — "
+        "FABL/MEBL drop only if you enabled strict EPS. "
+        "SAZEW needs a backfill slot vs higher-yield names (e.g. MARI, OGDC)."
+    )
+
+
+def prompt_dividend_basket_use_or_replace(
+    df: pd.DataFrame,
+    *,
+    title: str,
+    replace_ctx: dict | None,
+) -> pd.DataFrame | None:
+    """
+    Show basket; [Y] proceed, [r] swap symbol(s) using same filters, [n] cancel.
+    replace_ctx keys: shariah_only, shariah_pool, min_div_yield, max_pe,
+    exclude_eps, dps_income_filter, weight_mode, prefer_blue_chip.
+    """
+    basket = df.copy()
+    if "dividend_yield" not in basket.columns:
+        basket["dividend_yield"] = 0.0
+    if "sector_name" not in basket.columns:
+        basket["sector_name"] = "UNKNOWN"
+    if "name" not in basket.columns:
+        basket["name"] = basket["symbol"].astype(str).map(_resolve_company_name)
+
+    div_ref: dict[str, float] = {}
+    weight_mode = "yield"
+    if replace_ctx:
+        cached = replace_ctx.get("div_ref")
+        if isinstance(cached, dict) and cached:
+            div_ref = cached
+        else:
+            div_ref = _dividend_basket_div_ref(
+                shariah_only=bool(replace_ctx.get("shariah_only")),
+                shariah_pool=str(replace_ctx.get("shariah_pool", "kmi30")),
+                quiet=True,
+            )
+        weight_mode = str(replace_ctx.get("weight_mode", "yield"))
+
+    while True:
+        _print_dividend_target_basket_table(basket, title=title)
+        ans = prompt(
+            "\nProceed to SIP? [Y] yes  [r] replace stock(s)  [n] cancel  "
+            "[why MEBL,FABL]: "
+        ).strip()
+        ans_l = ans.lower()
+        if ans_l.startswith("why") or ans_l.startswith("?"):
+            tail = ans_l.replace("why", "", 1).replace("?", "", 1).strip()
+            syms = [
+                t.strip().upper()
+                for t in tail.replace(";", ",").split(",")
+                if t.strip()
+            ]
+            if syms and replace_ctx:
+                _print_dividend_screen_symbol_diagnosis(
+                    syms,
+                    picked_symbols=set(basket["symbol"].astype(str).str.upper()),
+                    shariah_only=bool(replace_ctx.get("shariah_only")),
+                    shariah_pool=str(replace_ctx.get("shariah_pool", "kmi30")),
+                    min_div_yield=float(replace_ctx.get("min_div_yield", 0.0)),
+                    max_pe=replace_ctx.get("max_pe"),
+                    exclude_eps=bool(replace_ctx.get("exclude_eps")),
+                    dps_income_filter=str(
+                        replace_ctx.get("dps_income_filter", "off")
+                    ),
+                    target_count=len(basket),
+                    universe_mode=str(
+                        replace_ctx.get("universe_mode", "div20_expand")
+                    ),
+                )
+            else:
+                print("  Example: why MEBL,FABL,SAZEW")
+            continue
+        if ans_l in ("n", "no"):
+            print("  Cancelled.")
+            return None
+        if ans_l in ("", "y", "yes"):
+            return basket
+        if ans_l not in ("r", "replace", "swap", "edit"):
+            print("  Enter Y, r, n, or why SYMBOL.")
+            continue
+
+        held = set(basket["symbol"].astype(str).str.upper())
+        syms = basket["symbol"].astype(str).str.upper().tolist()
+        print(
+            "\n  Replace — line number(s) or symbol(s), comma-sep "
+            "(e.g. 5,6 or ISL,CSAPXD):"
+        )
+        drop_raw = prompt("Drop: ").strip()
+        if not drop_raw:
+            continue
+        drop_list = _parse_basket_drop_symbols(drop_raw, syms)
+        if not drop_list:
+            print("  Could not match any line or symbol in this basket.")
+            continue
+        print(f"  Removing: {', '.join(drop_list)}")
+
+        held_after = held - set(drop_list)
+        new_syms: list[str] = []
+        cands = pd.DataFrame()
+        if replace_ctx:
+            cands = _dividend_replacement_candidates(
+                held_after,
+                shariah_only=bool(replace_ctx.get("shariah_only")),
+                shariah_pool=str(replace_ctx.get("shariah_pool", "kmi30")),
+                min_div_yield=float(replace_ctx.get("min_div_yield", 0.0)),
+                max_pe=replace_ctx.get("max_pe"),
+                exclude_eps=bool(replace_ctx.get("exclude_eps")),
+                dps_income_filter=str(
+                    replace_ctx.get("dps_income_filter", "off")
+                ),
+                prefer_blue_chip=bool(replace_ctx.get("prefer_blue_chip", True)),
+                div_ref=div_ref,
+            )
+            if not cands.empty:
+                print("\n  Suggested replacements (same filters as your basket):")
+                for j, (_, row) in enumerate(cands.iterrows(), start=1):
+                    pe = row.get("pe_ratio")
+                    pe_s = (
+                        f"{float(pe):.1f}" if pe is not None and pd.notna(pe) else "—"
+                    )
+                    tag = "index" if row.get("in_psxdiv20") else "screener"
+                    print(
+                        f"    {j}. {row['symbol']:<8} "
+                        f"{str(row['name'])[:30]:<30} "
+                        f"yield {float(row['dividend_yield']):.2f}%  P/E {pe_s}  ({tag})"
+                    )
+            else:
+                print("  No screener names match your filters (try looser filters).")
+
+        n_drop = len(drop_list)
+        pick = prompt(
+            f"\nAdd {n_drop} replacement(s) — comma-sep symbols or list numbers "
+            f"(e.g. FABL,MEBL or 1,3): "
+        ).strip()
+        if pick and not cands.empty:
+            new_syms = _parse_replacement_picks(pick, cands, n_drop)
+        elif pick:
+            new_syms = [
+                _tradable_equity_symbol(p.strip().upper())
+                for p in pick.replace(";", ",").split(",")
+                if p.strip()
+            ][:n_drop]
+        if len(new_syms) < n_drop:
+            manual = prompt(
+                "Type symbol(s) manually, comma-sep (or blank to cancel): "
+            ).strip()
+            if not manual:
+                continue
+            extra = [
+                _tradable_equity_symbol(p.strip().upper())
+                for p in manual.replace(";", ",").split(",")
+                if p.strip()
+            ]
+            new_syms = (new_syms + extra)[:n_drop]
+
+        if len(new_syms) != n_drop:
+            print(f"  Need exactly {n_drop} replacement(s); got {len(new_syms)}.")
+            continue
+
+        ok = True
+        for drop_sym, new_sym in zip(drop_list, new_syms):
+            if new_sym in held_after:
+                print(f"  {new_sym} is already in the basket.")
+                ok = False
+                break
+            new_row = _dividend_screener_row_to_basket_row(
+                new_sym, div_ref=div_ref, weight_mode=weight_mode
+            )
+            if new_row is None:
+                print(f"  Could not price or find {new_sym} on the PSX screener.")
+                ok = False
+                break
+            basket = basket[
+                basket["symbol"].astype(str).str.upper() != drop_sym
+            ]
+            basket = pd.concat(
+                [basket, pd.DataFrame([new_row])], ignore_index=True
+            )
+            held_after = held_after - {drop_sym} | {new_sym}
+            print(f"  Swapped {drop_sym} → {new_sym} ({new_row['name']}).")
+            dps_note, _ = _describe_dps_regularity(_dps_history(new_sym))
+            print(f"    DPS: {dps_note}")
+        if not ok:
+            continue
+        basket = _renormalize_dividend_basket_df(
+            basket, weight_mode=weight_mode, div_ref=div_ref
+        )
+
+
+def run_dividend_psxdiv20_screened_sip_flow() -> None:
+    """Top-N dividend basket with yield / P/E / optional DPS — not mutual-fund snapshot."""
+    print(
+        "\n  Dividend screened basket (PSX screener + optional PSXDIV20 weights — not advice)."
+    )
+    shariah_only = prompt_yes_no("Shariah-only (Islamic-index listed)", default_yes=True)
+    shariah_pool = "kmi30"
+    if shariah_only:
+        print(
+            "\n  Shariah list: 1=KMI30 (large cap)  "
+            "2=KMI All Share (wider — FATIMA, MTLXD, etc.)"
+        )
+        sp = prompt("Shariah list [2]: ").strip().lower() or "2"
+        shariah_pool = "kmi_all" if sp in ("2", "b", "all", "wide", "kmi_all") else "kmi30"
+
+    print("\n  Universe:")
+    print("    1. PSXDIV20 first, then KMI30 dividend backfill (recommended)")
+    print("    2. PSXDIV20 index members only")
+    print("    3. KMI30 dividend screener (all sectors — FATIMA, MTL, etc.)")
+    print("    4. My holdings only — screen what I own (not limited to PSXDIV20)")
+    uni_choice = prompt("Universe [1]: ").strip().lower() or "1"
+    universe_map = {
+        "1": "div20_expand",
+        "expand": "div20_expand",
+        "a": "div20_expand",
+        "2": "div20_only",
+        "div20": "div20_only",
+        "index": "div20_only",
+        "3": "kmi30_screen",
+        "kmi": "kmi30_screen",
+        "screener": "kmi30_screen",
+        "b": "kmi30_screen",
+        "4": "holdings",
+        "holdings": "holdings",
+        "mine": "holdings",
+        "csv": "holdings",
+    }
+    universe_mode = universe_map.get(uni_choice, "div20_expand")
+    pool_symbols: set[str] | None = None
+    if universe_mode == "holdings":
+        pool_symbols = _load_dividend_pool_from_holdings()
+        if not pool_symbols:
+            print("  Falling back to universe 1 (PSXDIV20 + backfill).")
+            universe_mode = "div20_expand"
+        else:
+            print(
+                f"  Holdings pool: {len(pool_symbols)} symbol(s) "
+                "(PSXDIV20 weight when indexed; else yield-ranked)."
+            )
+
+    target_count = int(prompt_positive_float("\nHow many stocks (typical 8)", 8.0))
+    target_count = max(3, min(20, target_count))
+    min_div = prompt_non_negative_float("Minimum dividend yield %", 2.0)
+    max_pe_raw = prompt("Maximum P/E (blank = no cap): ").strip()
+    max_pe = float(max_pe_raw) if max_pe_raw else None
+    exclude_eps = prompt_dividend_eps_filter()
+    dps_income_filter = prompt_dps_income_filter()
+    wt_choice = prompt(
+        "Weights [1] PSXDIV20 index  [2] dividend yield [2]: "
+    ).strip().lower() or "2"
+    weight_mode = "yield" if wt_choice in ("2", "yield", "y") else "index"
+    prefer_blue_chip = prompt_yes_no(
+        "Prefer KSE100/KSE30 blue chips when filling the basket",
+        default_yes=True,
+    )
+
+    print("\nBuilding screened dividend basket…")
+    df = _build_psxdiv20_screened_basket(
+        target_count=target_count,
+        shariah_only=shariah_only,
+        shariah_pool=shariah_pool,
+        pool_symbols=pool_symbols,
+        universe_mode=universe_mode,
+        min_div_yield=min_div,
+        max_pe=max_pe,
+        exclude_eps_decliners=exclude_eps,
+        dps_income_filter=dps_income_filter,
+        weight_mode=weight_mode,
+        prefer_blue_chip=prefer_blue_chip,
+    )
+
+    sym_list = df["symbol"].astype(str).tolist()
+    _print_dps_consistency_table(sym_list)
+    print(
+        "\n  Note: PSX index/screener often uses *XD tickers (e.g. HUBCXD); "
+        "company names and DPS history are resolved from the main line (e.g. HUBC) "
+        "when PSX has no separate profile for the XD symbol."
+    )
+    print(
+        "  PSXDIV20 members are index rules (yield + history); backfill names are "
+        "high yield from your Shariah screener — not all are in the index."
+    )
+
+    title = "PSXDIV20 screened"
+    if shariah_only:
+        title += (
+            " · KMI All Share"
+            if shariah_pool != "kmi30"
+            else " · KMI30"
+        )
+    if pool_symbols:
+        title += " · holdings pool"
+
+    replace_ctx = {
+        "shariah_only": shariah_only,
+        "shariah_pool": shariah_pool,
+        "min_div_yield": min_div,
+        "max_pe": max_pe,
+        "exclude_eps": exclude_eps,
+        "dps_income_filter": dps_income_filter,
+        "weight_mode": weight_mode,
+        "prefer_blue_chip": prefer_blue_chip,
+        "universe_mode": universe_mode,
+        "div_ref": _dividend_basket_div_ref(
+            shariah_only=shariah_only, shariah_pool=shariah_pool, quiet=True
+        ),
+    }
+    df = prompt_dividend_basket_use_or_replace(
+        df, title=title, replace_ctx=replace_ctx
+    )
+    if df is None:
+        return
+
+    basket_id = "div_psxdiv20_screened"
+    meta = {
+        "index_name": basket_id,
+        "as_of": _utc_now_iso(),
+        "title": title,
+        "parsed_holdings": [],
+        "missing_price_symbols": [],
+        "sip_profile": "dividend_basket",
+    }
+    _run_benchmark_sip_flow(
+        df,
+        meta,
+        source_type="custom",
+        source_id=basket_id,
+        universe_label="dividend basket",
+        weight_label="target",
+        empty_exclusion_msg="All names were excluded. Nothing to allocate.",
+        exclusion_unit="names",
+    )
+
+
 def choose_dividend_portfolio_style() -> str:
-    print("\n  1. SIP — set holdings from mutual fund + PSXDIV20 (recommended)")
-    print("  2. SIP — PSXDIV20 index only")
-    print("  3. SIP — high-yield stock pick (PSXDIV20 or whole market)")
-    print("  4. View holdings only — no SIP plan")
+    print(
+        "\n  1. Screened basket SIP (PSXDIV20 + backfill — DPS & yield) [recommended]"
+    )
+    print("  2. PSXDIV20 index SIP (all constituents — scope like KSE100)")
+    print("  3. High-yield pick (count + pool: PSXDIV20 or screener)")
+    print("  4. Mutual fund + PSXDIV20 blend (FMR snapshot — may drift)")
+    print("  5. Fund/index holdings only — no SIP")
     print("  h. Dividend income tips")
     while True:
         choice = prompt("Select [1]: ") or "1"
         if _is_help_choice(choice):
             print_dividend_income_strategy_tips()
             continue
-        if choice in ("1", "mf", "blend", "both", "fund"):
-            return "mf_div_sip"
-        if choice in ("2", "index", "psxdiv20", "div20"):
+        if choice in ("1", "screen", "screened", "top", "psxdiv20"):
+            return "screened"
+        if choice in ("2", "index", "div20"):
             return "index"
         if choice in ("3", "sip", "yield", "scan", "stocks"):
             return "yield_sip"
-        if choice in ("4", "ref", "reference", "holdings", "see", "view"):
+        if choice in ("4", "mf", "blend", "both", "fund"):
+            return "mf_div_sip"
+        if choice in ("5", "ref", "reference", "holdings", "see", "view"):
             return "reference"
-        print("  Enter 1–4, or h.")
+        print("  Enter 1–5, or h.")
 
 
 def _choose_high_yield_sip_pool() -> tuple[set[str], str, str]:
@@ -3122,6 +4708,10 @@ def _choose_high_yield_sip_pool() -> tuple[set[str], str, str]:
 def run_dividend_portfolio_flow() -> None:
     print("\nDividend menu — compare fund holdings or plan a stock SIP (not advice).")
     style = choose_dividend_portfolio_style()
+
+    if style == "screened":
+        run_dividend_psxdiv20_screened_sip_flow()
+        return
 
     if style == "mf_div_sip":
         run_dividend_mf_psxdiv20_sip_flow()
@@ -3174,9 +4764,21 @@ def run_dividend_portfolio_flow() -> None:
     show = show.rename(columns={"idx_weight": "target_weight"})
     print(show.to_string(index=False))
 
-    confirm = prompt("\nUse this basket for SIP planning? [Y/n]: ").lower()
-    if confirm in ("n", "no"):
-        print("  Cancelled.")
+    df = prompt_dividend_basket_use_or_replace(
+        df,
+        title=label,
+        replace_ctx={
+            "shariah_only": False,
+            "shariah_pool": "kmi30",
+            "min_div_yield": min_div,
+            "max_pe": None,
+            "exclude_eps": exclude_eps,
+            "dps_income_filter": "off",
+            "weight_mode": "yield",
+            "prefer_blue_chip": True,
+        },
+    )
+    if df is None:
         return
 
     meta = {
@@ -3185,6 +4787,7 @@ def run_dividend_portfolio_flow() -> None:
         "title": label,
         "parsed_holdings": [],
         "missing_price_symbols": [],
+        "sip_profile": "dividend_basket",
     }
     _run_benchmark_sip_flow(
         df,
@@ -3390,7 +4993,7 @@ def run_stock_scanner_flow() -> None:
 
     export = prompt("\nSave full filtered list to CSV? [y/N]: ").lower()
     if export in ("y", "yes"):
-        default_name = f"psx_scan_{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv"
+        default_name = f"psx_scan_{_export_date_tag()}.csv"
         path = prompt(f"File path [{default_name}]: ").strip() or default_name
         path = os.path.expanduser(path)
         filtered.to_csv(path, index=False)
@@ -3419,6 +5022,7 @@ def run_stock_scanner_flow() -> None:
         "title": f"Scanner basket {basket_id}",
         "parsed_holdings": [],
         "missing_price_symbols": [],
+        "sip_profile": "dividend_basket",
     }
     _run_benchmark_sip_flow(
         df,
@@ -3538,9 +5142,21 @@ def run_custom_basket_flow() -> None:
     )
     print(show.to_string(index=False))
 
-    confirm = prompt("\nUse this basket for SIP planning? [Y/n]: ").lower()
-    if confirm in ("n", "no"):
-        print("  Cancelled.")
+    df = prompt_dividend_basket_use_or_replace(
+        df,
+        title=f"Custom basket {basket_id}",
+        replace_ctx={
+            "shariah_only": False,
+            "shariah_pool": "kmi30",
+            "min_div_yield": min_div,
+            "max_pe": None,
+            "exclude_eps": exclude_eps,
+            "dps_income_filter": "off",
+            "weight_mode": "yield",
+            "prefer_blue_chip": True,
+        },
+    )
+    if df is None:
         return
 
     meta = {
@@ -3550,6 +5166,7 @@ def run_custom_basket_flow() -> None:
         "parsed_holdings": [],
         "missing_price_symbols": [],
         "custom_blend": f"{w_blue:.2f},{w_div:.2f},{w_growth:.2f}",
+        "sip_profile": "dividend_basket",
     }
     _run_benchmark_sip_flow(
         df,
@@ -3768,18 +5385,13 @@ def _pe_ratio_by_symbol() -> dict[str, float]:
 
 
 def _is_regular_dps_payer(sym: str) -> tuple[bool, str]:
-    """True when 5y DPS history looks like a regular cash payer (not irregular / none)."""
+    """True when name passes balanced DPS income screen (keeps 2/5+ and yield-only)."""
     hist = _dps_history(sym)
-    note, irregular = _describe_dps_regularity(hist)
-    years = int(hist.get("years_with_dividends") or 0)
-    lb = int(hist.get("lookback_years") or _DPS_LOOKBACK_YEARS)
-    if irregular or years == 0:
+    note, _irregular = _describe_dps_regularity(hist)
+    tier = _dps_income_tier(hist)
+    if _dps_tier_excluded(tier, "balanced"):
         return False, note
-    if years >= lb - 1:
-        return True, note
-    if years >= max(2, lb // 2):
-        return True, note
-    return False, note
+    return True, note
 
 
 def _symbol_quality_check(
@@ -3795,6 +5407,7 @@ def _symbol_quality_check(
         ok_dps, dnote = _is_regular_dps_payer(sym)
         if ok_dps:
             return True, f"regular DPS ({dnote})"
+        return False, dnote
     sym = sym.upper()
     if max_pe is not None:
         pe = pe_map.get(sym)
@@ -4071,11 +5684,13 @@ def apply_topup_allocation_tweaks(
     live_df: pd.DataFrame,
     universe_label: str,
     topup_strategy: str,
+    sip_profile: str = "standard",
 ) -> pd.DataFrame:
     if topup_strategy == "dividend_tilt":
         scoped = maybe_rotate_dividend_additions(scoped, live_df)
     scoped = prompt_optional_topup_exclusions(scoped, universe_label=universe_label)
-    scoped = prompt_topup_quality_and_replacements(scoped, live_df)
+    if sip_profile != "dividend_basket":
+        scoped = prompt_topup_quality_and_replacements(scoped, live_df)
     if scoped.empty:
         return scoped
     if topup_strategy == "dividend_tilt":
@@ -5330,6 +6945,8 @@ def report_holdings_alignment(
     live_df: pd.DataFrame,
     source_type: str,
     source_id: str,
+    *,
+    compact: bool = False,
 ) -> None:
     """Compare user share counts to live index/ETF weights (no trades)."""
     target = _benchmark_target_pct(live_df)
@@ -5417,9 +7034,14 @@ def report_holdings_alignment(
             }
         )
 
-    print("\n  Your holdings vs benchmark (in-basket only):\n")
     show = pd.DataFrame(detail)
-    disp = show[
+    if compact:
+        print("\n  Held lines (largest by value):\n")
+        disp = show.sort_values("value_pkr", ascending=False).head(8)
+    else:
+        print("\n  Your holdings vs benchmark (in-basket only):\n")
+        disp = show.sort_values("symbol")
+    disp = disp[
         [
             "symbol",
             "shares",
@@ -5442,22 +7064,24 @@ def report_holdings_alignment(
             "within_holdings_gap": "vs_renorm_bench",
         }
     )
-    print(disp.sort_values("symbol").to_string(index=False))
-    print(
-        "\n  vs_renorm_bench: your weight minus benchmark weight re-normalized "
-        "to names you hold (+ = overweight within your portfolio)."
-    )
+    print(disp.to_string(index=False))
+    if not compact:
+        print(
+            "\n  vs_renorm_bench: your weight minus benchmark weight re-normalized "
+            "to names you hold (+ = overweight within your portfolio)."
+        )
 
     if orphan_rows:
         print("\n  Not in current benchmark (still in your file):")
         for r in orphan_rows:
             print(f"    {r['symbol']}: {r['shares']} shares")
 
-    print_switch_considerations(held_symbols, live_df)
-    print(
-        "\n  (Review only — the planner does not ask you to confirm each add/sell; "
-        "use menu 1 or 2 when you want a SIP plan.)"
-    )
+    if not compact:
+        print_switch_considerations(held_symbols, live_df)
+        print(
+            "\n  (Review only — the planner does not ask you to confirm each add/sell; "
+            "use menu 1 or 2 when you want a SIP plan.)"
+        )
 
 
 def choose_align_benchmark_kind() -> str:
@@ -5502,7 +7126,7 @@ def run_holdings_align_flow() -> None:
         "\nLoad holdings to compare (holdings snapshot CSV, plan CSV, or manual)."
     )
     prior, snap_header, snap_df = choose_topup_holdings_source(
-        f"psx_sip_holdings_{source_id.lower()}.csv",
+        resolve_default_holdings_snapshot_path(source_id),
         source_type,
         source_id,
     )
@@ -5512,6 +7136,8 @@ def run_holdings_align_flow() -> None:
     if ans not in ("y", "yes"):
         return
 
+    if snap_df is not None and not snap_df.empty:
+        report_basket_drift(snap_df, live_df, snap_header)
     skip_syms, add_syms, apply_skip, apply_add = report_topup_new_money_guide(
         prior, live_df, source_type, source_id
     )
@@ -5524,6 +7150,8 @@ def run_holdings_align_flow() -> None:
         topup_strategy=topup_strategy,
         snapshot_df=snap_df,
         snapshot_header=snap_header,
+        show_basket_drift=False,
+        show_switch_hints=False,
     )
     if scoped.empty:
         print("  No symbols to allocate; cannot top-up.")
@@ -5554,7 +7182,7 @@ def run_holdings_align_flow() -> None:
     _finalize_sip_plan(
         scoped,
         investment_pkr,
-        default_csv=f"psx_sip_plan_{source_id.lower()}.csv",
+        default_csv=export_plan_csv_name(source_id),
         source_type=source_type,
         source_id=source_id,
         live_df=live_df,
@@ -5743,22 +7371,99 @@ def print_switch_considerations(
     print(show.to_string(index=False))
 
 
-def choose_sip_mode(source_id: str = "") -> str:
-    print("\nHow should this SIP run?\n")
-    print("  1. New plan (pick scope / exclusions as usual)")
+def _peek_holdings_file(
+    path: str,
+) -> tuple[dict[str, int], dict[str, str] | None, pd.DataFrame | None] | None:
+    """Load shares from a CSV without exiting the program on failure."""
+    try:
+        if _is_holdings_snapshot_file(path):
+            header, snap = load_holdings_snapshot(path)
+            prior = prior_shares_from_holdings_df(snap)
+            if not prior:
+                return None
+            return prior, header, snap
+        prior = load_prior_shares_from_plan_csv(path)
+        if not prior:
+            return None
+        return prior, None, None
+    except (OSError, ValueError, pd.errors.EmptyDataError):
+        return None
+
+
+def preview_saved_holdings_vs_basket(
+    live_df: pd.DataFrame,
+    source_type: str,
+    source_id: str,
+) -> None:
+    """If a prior holdings file exists, show alignment before new vs top-up."""
+    if live_df.empty or not source_id:
+        return
+    path = resolve_default_holdings_snapshot_path(source_id)
+    if not os.path.isfile(path):
+        legacy = f"psx_sip_holdings_{source_id.lower()}.csv"
+        if os.path.isfile(legacy):
+            path = legacy
+        else:
+            state = load_user_state()
+            last = state.get("last_holdings_path", "")
+            if last and os.path.isfile(last):
+                path = last
+            else:
+                return
+    peek = _peek_holdings_file(path)
+    if peek is None:
+        return
+    prior, header, snap = peek
     print(
-        "  2. Top-up existing holdings only "
-        "(snapshot CSV, old plan CSV, or manual entry)"
+        f"\n{'=' * 72}\n"
+        f"  Saved holdings vs current basket — {os.path.basename(path)}\n"
+        f"  (Pick 1 = fresh monthly plan · 2 = top-up from these holdings)\n"
+        f"{'=' * 72}"
     )
+    report_holdings_alignment(
+        prior, live_df, source_type, source_id, compact=True
+    )
+    if snap is not None and not snap.empty:
+        report_basket_drift(snap, live_df, header)
+    print_switch_considerations({s for s, q in prior.items() if q > 0}, live_df)
+
+
+def choose_sip_mode(
+    source_id: str = "",
+    *,
+    sip_profile: str = "standard",
+    live_df: pd.DataFrame | None = None,
+    source_type: str = "",
+) -> str:
+    if live_df is not None and not live_df.empty and source_id:
+        preview_saved_holdings_vs_basket(live_df, source_type, source_id)
+    if sip_profile == "dividend_basket":
+        print("\n  Dividend basket is set — next: PKR amount → plan CSV.\n")
+        print("  1. Invest in this basket (all names unless you skip below)")
+        print(
+            "  2. Top-up existing holdings "
+            "(holdings CSV; PSX_SIP_HOLDINGS skips this menu)"
+        )
+    else:
+        print("\nHow should this SIP run?\n")
+        print("  1. New plan (scope & exclusions)")
+        print(
+            "  2. Top-up existing holdings "
+            "(snapshot CSV, old plan CSV, or manual entry)"
+        )
     print("  h. Help (shortcuts)")
     default_snap = (
-        f"psx_sip_holdings_{source_id.lower()}.csv" if source_id else ""
+        resolve_default_holdings_snapshot_path(source_id) if source_id else ""
     )
     if default_snap and os.path.isfile(default_snap):
-        print(f"\n  → Found ./{default_snap} — option 2 will offer to use it.")
+        print(
+            f"\n  → Holdings on disk: {default_snap} — option 2 uses this (or pick another)."
+        )
     state = load_user_state()
     last = state.get("last_holdings_path", "")
-    if last and os.path.isfile(last):
+    if last and os.path.isfile(last) and os.path.abspath(last) != os.path.abspath(
+        default_snap or ""
+    ):
         print(f"  → Last saved: {last}")
     print()
     while True:
@@ -5778,7 +7483,36 @@ def resolve_user_path(raw: str) -> str:
     return os.path.abspath(os.path.expanduser(raw.strip()))
 
 
-def prompt_existing_csv_path() -> str:
+def prompt_existing_csv_path(source_id: str = "") -> str:
+    discovered = discover_psx_sip_csv_files(
+        source_id=source_id,
+        include_plans=True,
+        include_holdings=True,
+        max_results=25,
+        prompt_extra_folder=True,
+    )
+    if discovered:
+        roots = _csv_search_directories()
+        where = roots[0] if len(roots) == 1 else ", ".join(roots)
+        print(f"\n  Found PSX SIP CSV file(s) in: {where}")
+        while True:
+            print("\n  1. Type a different CSV path")
+            for i, (label, path) in enumerate(discovered, start=2):
+                print(f"  {i}. {label}")
+                print(f"     {path}")
+            print("  h. Help (shortcuts)\n")
+            default_pick = "2"
+            raw = prompt(f"Select [{default_pick}]: ").strip() or default_pick
+            if _is_help_choice(raw):
+                print_usage_tips()
+                continue
+            if raw == "1":
+                break
+            if raw.isdigit():
+                pick = int(raw)
+                if 2 <= pick < 2 + len(discovered):
+                    return discovered[pick - 2][1]
+            print(f"  Enter 1–{1 + len(discovered)} or h.")
     print("\n  Path can be relative, absolute, or use ~")
     print(f"  Current folder: {os.getcwd()}\n")
     while True:
@@ -5899,7 +7633,10 @@ def _env_holdings_csv_path() -> str | None:
     return path
 
 
-def _discover_holdings_file_options(default_snapshot: str) -> list[tuple[str, str]]:
+def _discover_holdings_file_options(
+    default_snapshot: str,
+    source_id: str = "",
+) -> list[tuple[str, str]]:
     seen: set[str] = set()
     options: list[tuple[str, str]] = []
 
@@ -5918,8 +7655,19 @@ def _discover_holdings_file_options(default_snapshot: str) -> list[tuple[str, st
         if sid:
             lbl += f" ({sid})"
         add(lbl, last)
-    if default_snapshot:
-        add(f"File in this folder ({default_snapshot})", default_snapshot)
+    if default_snapshot and os.path.isfile(default_snapshot):
+        add(
+            f"Suggested for this basket ({os.path.basename(default_snapshot)})",
+            default_snapshot,
+        )
+    for label, path in discover_psx_sip_csv_files(
+        source_id=source_id,
+        include_plans=True,
+        include_holdings=True,
+        max_results=30,
+        prompt_extra_folder=True,
+    ):
+        add(label, path)
     return options
 
 
@@ -5933,10 +7681,14 @@ def choose_topup_holdings_source(
         print(f"\nUsing PSX_SIP_HOLDINGS: {env_path}")
         return _load_prior_shares_from_any_csv(env_path, source_type, source_id)
 
-    discovered = _discover_holdings_file_options(default_snapshot)
+    discovered = _discover_holdings_file_options(default_snapshot, source_id)
 
     while True:
         print("\nLoad holdings for top-up:\n")
+        if discovered:
+            roots = _csv_search_directories()
+            where = roots[0] if len(roots) == 1 else ", ".join(roots)
+            print(f"  Found {len(discovered)} CSV(s) — search folder(s): {where}\n")
         print(
             "  1. Enter CSV path (any name — holdings snapshot or plan CSV)"
         )
@@ -5952,7 +7704,8 @@ def choose_topup_holdings_source(
         print("  h. Help (shortcuts)")
         print()
 
-        raw = prompt("Select [1]: ") or "1"
+        default_pick = "2" if discovered else "1"
+        raw = prompt(f"Select [{default_pick}]: ") or default_pick
         if _is_help_choice(raw):
             print_usage_tips()
             continue
@@ -5962,7 +7715,7 @@ def choose_topup_holdings_source(
         pick = int(raw)
 
         if pick == 1:
-            path = prompt_existing_csv_path()
+            path = prompt_existing_csv_path(source_id)
             print(f"\nUsing: {path}")
             return _load_prior_shares_from_any_csv(path, source_type, source_id)
 
@@ -6009,13 +7762,15 @@ def run_topup_from_prior_shares(
     topup_strategy: str = "held_weights",
     snapshot_df: pd.DataFrame | None = None,
     snapshot_header: dict[str, str] | None = None,
+    show_basket_drift: bool = True,
+    show_switch_hints: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
     held_symbols = {s for s, q in prior_shares.items() if q > 0}
     if not held_symbols:
         print("  No holdings with share count > 0.")
         sys.exit(1)
 
-    if snapshot_df is not None:
+    if show_basket_drift and snapshot_df is not None:
         report_basket_drift(snapshot_df, live_df, snapshot_header)
 
     if topup_strategy == "benchmark_gap":
@@ -6023,7 +7778,8 @@ def run_topup_from_prior_shares(
             f"\nTop-up: benchmark gap-fill on full {source_type} {source_id} "
             f"({len(live_df)} names)."
         )
-        print_switch_considerations(held_symbols, live_df)
+        if show_switch_hints:
+            print_switch_considerations(held_symbols, live_df)
         return live_df.reset_index(drop=True), prior_shares
 
     live_syms = live_df["symbol"].astype(str).str.upper()
@@ -6060,7 +7816,8 @@ def run_topup_from_prior_shares(
     show = subset[["symbol", "name", "idx_weight"]].copy()
     show["idx_weight"] = show["idx_weight"].map(lambda w: f"{w:.2f}%")
     print(show.to_string(index=False))
-    print_switch_considerations(held_symbols, live_df)
+    if show_switch_hints:
+        print_switch_considerations(held_symbols, live_df)
     return subset.reset_index(drop=True), prior_shares
 
 
@@ -6069,9 +7826,20 @@ def run_topup_flow(
     source_type: str,
     source_id: str,
     default_snapshot: str,
+    *,
+    sip_profile: str = "standard",
 ) -> tuple[pd.DataFrame, dict[str, int], str]:
     prior, snap_header, snap_df = choose_topup_holdings_source(
         default_snapshot, source_type, source_id
+    )
+    print(f"\n{'=' * 72}")
+    print("  Top-up: your holdings vs current basket")
+    print(f"{'=' * 72}")
+    report_holdings_alignment(prior, live_df, source_type, source_id)
+    if snap_df is not None and not snap_df.empty:
+        report_basket_drift(snap_df, live_df, snap_header)
+    print_switch_considerations(
+        {s for s, q in prior.items() if q > 0}, live_df
     )
     skip_syms, add_syms, apply_skip, apply_add = report_topup_new_money_guide(
         prior, live_df, source_type, source_id
@@ -6085,6 +7853,8 @@ def run_topup_flow(
         topup_strategy=topup_strategy,
         snapshot_df=snap_df,
         snapshot_header=snap_header,
+        show_basket_drift=False,
+        show_switch_hints=False,
     )
     scoped = apply_new_money_hint_selection(
         scoped,
@@ -6100,6 +7870,7 @@ def run_topup_flow(
         live_df=live_df,
         universe_label=label,
         topup_strategy=topup_strategy,
+        sip_profile=sip_profile,
     )
     return scoped, prior, topup_strategy
 
@@ -6171,9 +7942,7 @@ def _finalize_sip_plan(
     print_plan(plan, investment_pkr, use_board_lot, cost_buffer_pct)
     maybe_save_csv(plan, default_name=default_csv)
     holdings_default = (
-        f"psx_sip_holdings_{source_id.lower()}.csv"
-        if source_id
-        else "psx_sip_holdings.csv"
+        export_holdings_csv_name(source_id) if source_id else export_holdings_csv_name("holdings")
     )
     maybe_save_holdings_snapshot(
         plan,
@@ -6200,19 +7969,40 @@ def _run_benchmark_sip_flow(
     empty_exclusion_msg: str,
     exclusion_unit: str,
 ) -> None:
-    """Shared Index / ETF SIP path (new plan, top-up, scope, snapshot)."""
-    mode = choose_sip_mode(source_id)
+    """Shared Index / ETF / dividend SIP path (new plan, top-up, snapshot)."""
+    sip_profile = str(meta.get("sip_profile") or "standard")
+    mode = choose_sip_mode(
+        source_id,
+        sip_profile=sip_profile,
+        live_df=df,
+        source_type=source_type,
+    )
     prior_shares: dict[str, int] | None = None
     topup_strategy = "held_weights"
     scoped: pd.DataFrame
     if mode == "topup":
-        default_path = f"psx_sip_holdings_{source_id.lower()}.csv"
+        default_path = resolve_default_holdings_snapshot_path(source_id)
         scoped, prior_shares, topup_strategy = run_topup_flow(
-            df, source_type, source_id, default_path
+            df, source_type, source_id, default_path, sip_profile=sip_profile
         )
         if scoped.empty:
             print("  No symbols left for this top-up after adjustments.")
             return
+    elif sip_profile == "dividend_basket":
+        print(
+            f"\n  Using your confirmed basket ({len(df)} names, target weights)."
+        )
+        valid = set(df["symbol"].astype(str))
+        symbol_raw = prompt(
+            "Skip any symbol this month? (comma-sep, blank = invest in all): "
+        )
+        exclude_symbols = parse_symbol_list(symbol_raw, valid)
+        scoped = apply_exclusions(df, set(), exclude_symbols)
+        if scoped.empty:
+            print(empty_exclusion_msg)
+            return
+        if exclude_symbols:
+            print(f"  Investing in {len(scoped)} of {len(df)} names this run.")
     else:
         exclude_sectors, exclude_symbols = prompt_exclusions(
             df, universe_label=universe_label
@@ -6240,7 +8030,7 @@ def _run_benchmark_sip_flow(
     _finalize_sip_plan(
         scoped,
         investment_pkr,
-        default_csv=f"psx_sip_plan_{source_id.lower()}.csv",
+        default_csv=export_plan_csv_name(source_id),
         source_type=source_type,
         source_id=source_id,
         live_df=df,
