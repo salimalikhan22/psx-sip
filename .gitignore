@@ -11,6 +11,9 @@ __pycache__/
 *.xls
 *.xlsm
 
+# Optional local builders (not required to run psx_sip_planner.py)
+build_dividend_*.py
+
 # Optional local planner state (paths only — lives in ~/.psx-sip/ at runtime)
 .psx-sip/
 
