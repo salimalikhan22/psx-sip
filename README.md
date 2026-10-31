@@ -1,136 +1,111 @@
 # PSX SIP Planner
 
-Interactive **Pakistan Stock Exchange (PSX)** tool:
+Interactive **Pakistan Stock Exchange (PSX)** tool for index/ETF/dividend SIP planning and market insights.
 
-1. **Index SIP** — allocate a monthly amount across index constituents (weights, exclusions, board lots).
-2. **ETF SIP** — same for an ETF’s published creation-unit basket (with sector preview and ETF unit price).
-3. **Insights** — full snapshot, **multiple indices and/or ETFs** (not all), custom mix, or sectors only; optional CSV export.
-4. **Compare holdings** — resemblance vs an index or ETF.
-5. **Stock scanner** — filter the PSX screener (P/E, dividend yield, etc.) and optionally enrich with EPS from company pages; export CSV or build a small SIP basket.
+**Main menu:** **Invest** (index, ETF, dividend basket SIP) · **Insights** (overview, compare holdings, stock scanner).
 
-Data comes from [psxdata](https://pypi.org/project/psxdata/) (PSX Data Portal). Cache lives under `~/.psxdata/cache/` by default.
+Data comes from [psxdata](https://pypi.org/project/psxdata/) (PSX Data Portal).
 
-**Author:** Salim Ali Khan · **Version:** 1.2.9 · **Date:** October 2026
+**Author:** Salim Ali Khan · **Version:** 1.4.4 · **Date:** October 2026
 
 ## Requirements
 
 - Python **3.10+**
 - Network access to `dps.psx.com.pk`
 
-## Run from a zip (any machine)
+## Run on any machine (recommended — full repo)
+
+Clone this repository, create a venv, install deps, run from the folder where you keep your CSV exports:
 
 ```bash
-unzip psx-sip-portable.zip -d psx-sip && cd psx-sip
+git clone https://github.com/salimalikhan22/psx-sip.git
+cd psx-sip
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+cd ~/my-sip-exports   # optional: folder for plan/holdings CSVs
+../psx-sip/.venv/bin/python ../psx-sip/psx_sip_planner.py
+```
+
+Or run inside the clone (CSVs saved in `psx-sip/`):
+
+```bash
+cd psx-sip
 .venv/bin/python psx_sip_planner.py
 ```
 
-Or without a venv (uses your user site-packages after first-time bootstrap):
+Without a venv (auto `pip install` on first run if deps missing):
 
 ```bash
 python3 psx_sip_planner.py
 ```
 
-Skip auto-install (fail if deps missing):
+Skip auto-install:
 
 ```bash
 PSX_SIP_NO_PIP=1 python3 psx_sip_planner.py
 ```
 
-## Run from GitHub (curl pipe)
+## What is in this repo (runtime)
 
-Replace `YOUR_USER` / `YOUR_REPO` / `BRANCH` with your repo after you push.
+These files are **required** for the full planner (including dividend fund reference and PSXDIV20 menus):
 
-**One-liner** (downloads script, installs deps if needed, runs interactively in a real terminal):
+| Path | Purpose |
+|------|---------|
+| `psx_sip_planner.py` | Main program |
+| `dividend_funds_data.py` | Mutual fund reference loader |
+| `data/dividend_fund_composition.json` | Saved FMR top-10 snapshots (not live NAV) |
+| `requirements.txt` | `psxdata`, `pandas` |
+| `.gitignore` | Excludes local `*.csv` / `*.xlsx` exports |
 
-```bash
-curl -fsSL "https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/BRANCH/psx_sip_planner.py" | python3 -
-```
+**Not in git:** your plan/holdings CSVs, Excel workbooks, `.venv`, and optional `~/.psx-sip/user_state.json` (last file path only).
 
-Prompts read from your terminal even though the script arrives on stdin (Linux/macOS/WSL).
+Local helper scripts such as `build_dividend_*.py` and generated spreadsheets are **optional** and intentionally not published.
 
-**Save locally then run** (recommended if you use it often):
+## Single-file download (limited)
+
+Index/ETF/scanner paths work if you only fetch the main script. **Dividend fund blend / FMR menus** need `dividend_funds_data.py` and `data/dividend_fund_composition.json` beside the script (use `git clone` above).
 
 ```bash
 curl -fsSL -o psx_sip_planner.py \
-  "https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/BRANCH/psx_sip_planner.py"
+  "https://raw.githubusercontent.com/salimalikhan22/psx-sip/main/psx_sip_planner.py"
 python3 psx_sip_planner.py
 ```
 
-The script only runs `pip install` when `pandas` or `psxdata` are missing. It does not modify your project files—only optional packages and PSX’s cache directory.
+## Privacy
 
-## Push to GitHub (one-time)
+- Source on GitHub contains **no portfolio data**.
+- **No telemetry** — network use is public PSX data via `psxdata`.
+- Plans/holdings are written only when you confirm save, to paths you choose.
+- Default is **live PSX** each fetch; optional `PSX_SIP_USE_CACHE=1` uses `~/.psxdata/cache/`.
+- Type **`h`** at any menu for shortcuts.
 
-From this folder:
+## Top-up and CSV discovery
 
-```bash
-git init
-git add psx_sip_planner.py requirements.txt README.md .gitignore
-git commit -m "Add PSX index/ETF SIP planner and insights"
-gh repo create psx-sip --public --source=. --push
-```
-
-Then update the curl URL in this README to match your repo.
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `psx_sip_planner.py` | Single entry point (SIP + insights) |
-| `requirements.txt` | Pinned minimum deps for venv installs |
-
-## Privacy (public script)
-
-- The **GitHub script** is only source code — it does **not** contain your portfolio.
-- **No telemetry**: nothing is sent to the author; network use is **public PSX data** via `psxdata` (`dps.psx.com.pk`).
-- **Your CSVs stay on your machine** — plan/holdings files are written only when you confirm save, to a path you choose.
-- **psx-sip defaults to no cache** (live PSX). Optional `PSX_SIP_USE_CACHE=1` enables psxdata’s `~/.psxdata/cache/` (~15 min) and in-session ETF reuse.
-- **Optional local reminder** `~/.psx-sip/user_state.json` stores only the **path** to your last holdings file (not share counts). Set `PSX_SIP_NO_LOCAL_STATE=1` to disable.
-- **Do not commit** personal CSVs; this repo’s `.gitignore` excludes `*.csv`.
-
-At startup and after saving a snapshot, the planner prints what to do next. Type **`h`** at any menu for a short cheat sheet.
-
-## Pass an existing CSV (top-up)
-
-Interactive:
-
-1. Main menu → **2** (ETF or Index) → **2** Top-up existing holdings.
-2. Load menu **1** → type **any** CSV path (relative, absolute, or `~/…`). Snapshot and plan formats are auto-detected.
-
-Without retyping the path (env var):
-
-```bash
-PSX_SIP_HOLDINGS="$HOME/psx_sip_holdings_mznpetf.csv" python3 psx_sip_planner.py
-```
-
-Then choose ETF/Index → **2** Top-up. The planner loads that file and skips the holdings path prompt.
+- **Invest →** product → **Top-up** loads a holdings snapshot or plan CSV.
+- The planner lists `psx_sip_*.csv` in your **current working directory**; if none, it asks for a **folder to search**.
+- Optional: `PSX_SIP_HOLDINGS=/path/to/file.csv` skips the load menu.
+- Optional: `PSX_SIP_CSV_DIRS=dir1,dir2` always searches extra folders.
 
 | `PSX_SIP_HOLDINGS_KIND` | Effect |
 |-------------------------|--------|
-| `auto` (default) | Detect snapshot (`# psx-sip-holdings` header) vs plan CSV |
-| `snapshot` | Force holdings snapshot format (`shares_held` column) |
-| `plan` | Force SIP plan CSV (`symbol` + `shares` or `shares_held`) |
-
-Works with `curl … \| python3 -` as long as the CSV path is on your machine (not stdin).
+| `auto` (default) | Detect snapshot vs plan CSV |
+| `snapshot` | Force holdings snapshot (`# psx-sip-holdings` header) |
+| `plan` | Force SIP plan CSV |
 
 ## Environment variables
 
 | Variable | Effect |
 |----------|--------|
-| `PSX_SIP_HOLDINGS` | Path to holdings snapshot or plan CSV for top-up mode |
+| `PSX_SIP_HOLDINGS` | Path to holdings/plan CSV for top-up |
 | `PSX_SIP_HOLDINGS_KIND` | `auto`, `snapshot`, or `plan` |
-| `PSX_SIP_NO_LOCAL_STATE` | Do not read/write `~/.psx-sip/user_state.json` |
-| `PSX_SIP_USE_CACHE` | Enable psxdata disk cache (~15 min) and in-session ETF basket reuse |
-| `PSX_SIP_NO_CACHE` | Force live PSX (same as default; use if `USE_CACHE` is set in your shell) |
-| `PSX_SIP_PRELOAD_ETF_CATALOG` | Before ETF pick, fetch every ETF basket (old slow menu) |
-| `PSX_SIP_SKIP_BOOTSTRAP` | Do not attempt `pip install` |
-| `PSX_SIP_NO_PIP` | Exit with instructions if deps are missing |
-| `PSX_SIP_VERBOSE` | Show psxdata library warnings (OHLC/date cleanup on index history) |
+| `PSX_SIP_CSV_DIRS` | Comma-separated folders to search for exports |
+| `PSX_SIP_NO_LOCAL_STATE` | Do not use `~/.psx-sip/user_state.json` |
+| `PSX_SIP_USE_CACHE` | Enable psxdata disk cache |
+| `PSX_SIP_NO_CACHE` | Force live PSX |
+| `PSX_SIP_PRELOAD_ETF_CATALOG` | Pre-fetch all ETF baskets before pick |
+| `PSX_SIP_SKIP_BOOTSTRAP` / `PSX_SIP_NO_PIP` | Control dependency install |
+| `PSX_SIP_VERBOSE` | Show psxdata scraper warnings |
 
-### Insights mode and psxdata warnings
+## psxdata warnings
 
-If you see lines like **Unknown PSX column header**, **OHLC constraint violated**, **Duplicate date(s)**, or **Dates are not in chronological order**, those come from the **psxdata** library while it scrapes PSX index history—not from a crash in this planner. PSX’s published index OHLC series often has duplicate dates, out-of-order rows, and occasional bad highs/lows; psxdata flags those rows and the planner drops flagged rows when computing period highs.
-
-As of **v1.0.1**, those messages are suppressed by default. Set `PSX_SIP_VERBOSE=1` to see them again (useful when debugging or reporting issues upstream to [psxdata](https://pypi.org/project/psxdata/)).
-# psx-sip
+OHLC / duplicate-date messages come from **psxdata** while cleaning PSX index history. They are hidden by default; set `PSX_SIP_VERBOSE=1` to show them.

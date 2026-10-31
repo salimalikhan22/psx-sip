@@ -1,8 +1,21 @@
+# Virtualenv / Python
 .venv/
 venv/
 __pycache__/
 *.py[cod]
+*.pyo
+
+# Local SIP exports (never commit personal plans or holdings)
 *.csv
+*.xlsx
+*.xls
+*.xlsm
+
+# Optional local planner state (paths only — lives in ~/.psx-sip/ at runtime)
+.psx-sip/
+
+# Portable bundles (build locally if needed)
 psx-sip-portable.tar.gz
 psx-sip-portable.zip
+
 .DS_Store
