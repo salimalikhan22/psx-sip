@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.4.7"
+__version__ = "1.4.8"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -151,6 +151,10 @@ def fetch_stocks(
 BOARD_LOT = 500
 DEFAULT_COST_BUFFER_PCT = 0.5
 HOLDINGS_SNAPSHOT_VERSION = "2"
+
+
+class _HoldingsLoadCancelled(Exception):
+    """User rejected a holdings file (e.g. basket id mismatch)."""
 # Raw GitHub base for curl | python3 bootstrap (override with PSX_SIP_REPO_RAW).
 DEFAULT_PSX_SIP_REPO_RAW = (
     "https://raw.githubusercontent.com/salimalikhan22/psx-sip/main"
@@ -7613,11 +7617,13 @@ def choose_sip_mode(
     if live_df is not None and not live_df.empty and source_id:
         preview_saved_holdings_vs_basket(live_df, source_type, source_id)
     if sip_profile == "dividend_basket":
-        print("\n  Dividend basket is set — next: PKR amount → plan CSV.\n")
-        print("  1. Invest in this basket (all names unless you skip below)")
+        print("\n  Your confirmed basket is ready.\n")
         print(
-            "  2. Top-up existing holdings "
-            "(holdings CSV; PSX_SIP_HOLDINGS skips this menu when the file exists)"
+            "  1. This basket only — monthly SIP across all names "
+            "(no CSV; optional skip symbols next)"
+        )
+        print(
+            "  2. Use a holdings/plan CSV — then choose full basket vs overlap vs top-up"
         )
     else:
         print("\nHow should this SIP run?\n")
@@ -7785,7 +7791,8 @@ def _load_prior_shares_from_any_csv(
         use_plan = not use_snapshot
     if use_snapshot:
         header, snap = load_holdings_snapshot(path)
-        _warn_if_snapshot_mismatch(header, source_type, source_id)
+        if not _warn_if_snapshot_mismatch(header, source_type, source_id):
+            raise _HoldingsLoadCancelled()
         prior = prior_shares_from_holdings_df(snap)
         if not prior:
             print("  No shares_held > 0 in the holdings file.")
@@ -7857,7 +7864,10 @@ def choose_topup_holdings_source(
     env_path = _env_holdings_csv_path()
     if env_path:
         print(f"\nUsing PSX_SIP_HOLDINGS: {env_path}")
-        return _load_prior_shares_from_any_csv(env_path, source_type, source_id)
+        try:
+            return _load_prior_shares_from_any_csv(env_path, source_type, source_id)
+        except _HoldingsLoadCancelled:
+            print("  Pick a different holdings file below.\n")
 
     discovered = _discover_holdings_file_options(default_snapshot, source_id)
 
@@ -7895,12 +7905,18 @@ def choose_topup_holdings_source(
         if pick == 1:
             path = prompt_existing_csv_path(source_id)
             print(f"\nUsing: {path}")
-            return _load_prior_shares_from_any_csv(path, source_type, source_id)
+            try:
+                return _load_prior_shares_from_any_csv(path, source_type, source_id)
+            except _HoldingsLoadCancelled:
+                continue
 
         if 2 <= pick < manual_idx:
             path = menu_paths[pick - 2][1]
             print(f"\nUsing: {path}")
-            return _load_prior_shares_from_any_csv(path, source_type, source_id)
+            try:
+                return _load_prior_shares_from_any_csv(path, source_type, source_id)
+            except _HoldingsLoadCancelled:
+                continue
 
         if pick == manual_idx:
             return prompt_manual_holdings(), None, None
@@ -7912,9 +7928,10 @@ def _warn_if_snapshot_mismatch(
     header: dict[str, str] | None,
     source_type: str,
     source_id: str,
-) -> None:
+) -> bool:
+    """Return False if user declines to use a mismatched snapshot."""
     if not header:
-        return
+        return True
     file_type = header.get("source_type", "")
     file_id = header.get("source_id", "")
     if file_type and file_type != source_type:
@@ -7923,12 +7940,75 @@ def _warn_if_snapshot_mismatch(
             f"but you selected {source_type!r}."
         )
     if file_id and file_id.upper() != source_id.upper():
+        print(
+            f"\n  Note: this file is tagged for {file_id!r}; "
+            f"today's basket is {source_id!r}."
+        )
         ans = prompt(
-            f"  Prior record is for {file_id!r}, you chose {source_id!r}. "
-            "Continue anyway? [y/N]: "
+            "  Use this file anyway for top-up? [y/N] "
+            "(N = pick another file): "
         ).lower()
         if ans not in ("y", "yes"):
-            sys.exit(0)
+            return False
+    return True
+
+
+def choose_dividend_topup_allocation_mode(
+    prior_shares: dict[str, int],
+    live_df: pd.DataFrame,
+    source_id: str,
+) -> tuple[str, pd.DataFrame]:
+    """
+    After loading a CSV for dividend-basket top-up, pick how new cash maps to the basket.
+    Returns (mode, live_df) where mode is full_basket | topup_held | overlap_only.
+    """
+    basket_syms = set(live_df["symbol"].astype(str).str.upper())
+    held = {str(s).upper() for s, q in prior_shares.items() if q > 0}
+    common = sorted(basket_syms & held)
+    orphans = sorted(held - basket_syms)
+    missing = sorted(basket_syms - held)
+
+    print(f"\n{'=' * 72}")
+    print(f"  Confirmed basket: {source_id} ({len(basket_syms)} names)")
+    print(f"  Your file: {len(held)} symbol(s) · overlap with basket: {len(common)}")
+    if common:
+        print(f"  In both: {', '.join(common)}")
+    if missing:
+        show = missing[:10]
+        extra = f" … +{len(missing) - 10}" if len(missing) > 10 else ""
+        print(f"  In basket only (not in file): {', '.join(show)}{extra}")
+    if orphans:
+        show = orphans[:10]
+        extra = f" … +{len(orphans) - 10}" if len(orphans) > 10 else ""
+        print(f"  In file only (not in basket): {', '.join(show)}{extra}")
+    print(f"{'=' * 72}")
+    print(
+        "\n  How should this month's SIP use the basket you just confirmed?\n"
+        "  1. Full basket — invest across all basket names "
+        "(CSV kept for snapshot totals only; ignores orphan lines for allocation)\n"
+        "  2. Top-up held lines — new cash toward basket weights among names you "
+        "already hold in the basket\n"
+        "  3. Overlap only — buy only symbols in BOTH your file and this basket"
+    )
+    while True:
+        choice = prompt("Select [1]: ") or "1"
+        if _is_help_choice(choice):
+            print_usage_tips()
+            continue
+        if choice in ("1", "full", "basket", "all", "new"):
+            return "full_basket", live_df
+        if choice in ("2", "topup", "top-up", "held", "gap"):
+            return "topup_held", live_df
+        if choice in ("3", "overlap", "common", "both"):
+            if not common:
+                print("  No overlap — pick 1 (full basket) or load a different file.")
+                continue
+            sub = live_df[
+                live_df["symbol"].astype(str).str.upper().isin(common)
+            ].copy()
+            print(f"\n  Overlap-only top-up: {len(sub)} name(s).")
+            return "overlap_only", sub.reset_index(drop=True)
+        print("  Enter 1, 2, 3, or h.")
 
 
 def run_topup_from_prior_shares(
@@ -8010,46 +8090,63 @@ def run_topup_flow(
     prior, snap_header, snap_df = choose_topup_holdings_source(
         default_snapshot, source_type, source_id
     )
-    print(f"\n{'=' * 72}")
-    print("  Top-up: your holdings vs current basket")
-    print(f"{'=' * 72}")
-    report_holdings_alignment(prior, live_df, source_type, source_id)
-    if snap_df is not None and not snap_df.empty:
-        report_basket_drift(snap_df, live_df, snap_header)
-    print_switch_considerations(
-        {s for s, q in prior.items() if q > 0}, live_df
-    )
-    skip_syms, add_syms, apply_skip, apply_add = report_topup_new_money_guide(
-        prior, live_df, source_type, source_id
-    )
-    topup_strategy = choose_topup_strategy()
-    scoped, prior = run_topup_from_prior_shares(
-        prior,
-        live_df,
-        source_type,
-        source_id,
-        topup_strategy=topup_strategy,
-        snapshot_df=snap_df,
-        snapshot_header=snap_header,
-        show_basket_drift=False,
-        show_switch_hints=False,
-    )
+    live_alloc = live_df
+    alloc_mode = "topup_held"
+    if sip_profile == "dividend_basket":
+        alloc_mode, live_alloc = choose_dividend_topup_allocation_mode(
+            prior, live_df, source_id
+        )
+
+    if alloc_mode == "full_basket":
+        print(
+            f"\n  Full basket SIP: allocating across all {len(live_df)} confirmed names. "
+            "Your CSV is used for snapshot totals (shares_held), not to limit buys."
+        )
+        skip_syms: set[str] = set()
+        add_syms: set[str] = set()
+        apply_skip = False
+        apply_add = False
+        topup_strategy = "held_weights"
+        scoped = live_df.reset_index(drop=True)
+    else:
+        print(f"\n{'=' * 72}")
+        print("  Top-up: your holdings vs current basket")
+        print(f"{'=' * 72}")
+        report_holdings_alignment(prior, live_alloc, source_type, source_id)
+        if snap_df is not None and not snap_df.empty:
+            report_basket_drift(snap_df, live_alloc, snap_header)
+        skip_syms, add_syms, apply_skip, apply_add = report_topup_new_money_guide(
+            prior, live_alloc, source_type, source_id
+        )
+        topup_strategy = choose_topup_strategy()
+        scoped, prior = run_topup_from_prior_shares(
+            prior,
+            live_alloc,
+            source_type,
+            source_id,
+            topup_strategy=topup_strategy,
+            snapshot_df=snap_df,
+            snapshot_header=snap_header,
+            show_basket_drift=False,
+            show_switch_hints=False,
+        )
     scoped = apply_new_money_hint_selection(
         scoped,
-        live_df,
+        live_alloc,
         skip_syms,
         add_syms,
         apply_skip,
         apply_add,
     )
     label = "ETF basket" if source_type == "etf" else universe_label_from_source(source_type, source_id)
-    scoped = apply_topup_allocation_tweaks(
-        scoped,
-        live_df=live_df,
-        universe_label=label,
-        topup_strategy=topup_strategy,
-        sip_profile=sip_profile,
-    )
+    if alloc_mode != "full_basket":
+        scoped = apply_topup_allocation_tweaks(
+            scoped,
+            live_df=live_alloc,
+            universe_label=label,
+            topup_strategy=topup_strategy,
+            sip_profile=sip_profile,
+        )
     return scoped, prior, topup_strategy
 
 
