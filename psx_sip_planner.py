@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.4.6"
+__version__ = "1.4.7"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -1146,11 +1146,12 @@ Quick reference (type h or ? at any menu):
   • CSV auto-find: current folder only; if empty, you can name another folder to search.
   • Optional: PSX_SIP_CSV_DIRS=path1,path2 always adds extra search folders.
   • curl | python3: fund JSON auto-downloads to ~/.psx-sip/ (PSX_SIP_REPO_RAW to override).
+  • Whole-share SIP: ≥1 share per basket line when budget allows (PSX_SIP_MIN_ONE_SHARE=0 to disable).
   • Snapshot load shows basket drift (new/dropped names, weight shifts).
   • Match check (menu 4): Index or ETF → CSV or SYMBOL:qty → resemblance %.
   • Paths: relative (from cwd), absolute, or ~/file.csv — all work.
   • Multi-select indices/ETFs: type all (or *) to select every item in the list.
-  • Env: PSX_SIP_HOLDINGS=/path/to.csv skips the load menu in top-up.
+  • Env: PSX_SIP_HOLDINGS=/path/to.csv skips the load menu when that file exists.
   • Lost file? Top-up menu 2 (plan CSV) or 3 (SYMBOL:qty, e.g. FFC:1500).
   • Local reminder only: ~/.psx-sip/user_state.json (last file path). Set
     PSX_SIP_NO_LOCAL_STATE=1 to disable. Nothing is sent to the internet.
@@ -3757,9 +3758,9 @@ def run_dividend_reference_composition_flow() -> None:
 
 
 def _load_dividend_pool_from_holdings() -> set[str]:
-    env_path = os.environ.get("PSX_SIP_HOLDINGS", "").strip()
+    env_path = _env_holdings_csv_path()
     if env_path:
-        path = os.path.expanduser(env_path)
+        path = env_path
         print(f"\n  Using PSX_SIP_HOLDINGS: {path}")
     else:
         print("\n  Load holdings to screen (snapshot or plan CSV).")
@@ -7616,7 +7617,7 @@ def choose_sip_mode(
         print("  1. Invest in this basket (all names unless you skip below)")
         print(
             "  2. Top-up existing holdings "
-            "(holdings CSV; PSX_SIP_HOLDINGS skips this menu)"
+            "(holdings CSV; PSX_SIP_HOLDINGS skips this menu when the file exists)"
         )
     else:
         print("\nHow should this SIP run?\n")
@@ -7800,11 +7801,14 @@ def _env_holdings_csv_path() -> str | None:
     raw = os.environ.get("PSX_SIP_HOLDINGS", "").strip()
     if not raw:
         return None
-    path = os.path.expanduser(raw)
-    if not os.path.isfile(path):
-        print(f"  PSX_SIP_HOLDINGS file not found: {path}")
-        sys.exit(1)
-    return path
+    path = os.path.abspath(os.path.expanduser(raw))
+    if os.path.isfile(path):
+        return path
+    print(
+        f"\n  PSX_SIP_HOLDINGS points to a missing file:\n    {path}\n"
+        "  Opening the holdings picker instead (unset the variable to hide this message)."
+    )
+    return None
 
 
 def _discover_holdings_file_options(
