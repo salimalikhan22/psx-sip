@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.4.5"
+__version__ = "1.4.6"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -5969,6 +5969,74 @@ def prompt_portfolio_scope(
         print("  Let's pick again.\n")
 
 
+def _min_one_share_per_line_enabled(use_board_lot: bool) -> bool:
+    """Whole-share SIP: buy ≥1 share per line when budget allows (PSX_SIP_MIN_ONE_SHARE)."""
+    raw = os.environ.get("PSX_SIP_MIN_ONE_SHARE", "").strip().lower()
+    if raw in ("0", "no", "false", "off", "n"):
+        return False
+    if raw in ("1", "yes", "true", "on", "y"):
+        return True
+    # Board-lot mode: one lot per name is often unaffordable — stay proportional unless forced.
+    return not use_board_lot
+
+
+def _try_minimum_one_share_allocation(
+    plan: pd.DataFrame,
+    investment_pkr: float,
+    use_board_lot: bool,
+) -> pd.DataFrame | None:
+    """
+    If budget covers 1 lot/share for every line, start there then add weight-proportional shares.
+    Returns None when the minimum basket is too expensive (falls back to pure proportional).
+    """
+    lot = BOARD_LOT if use_board_lot else 1
+    out = plan.copy()
+    prices = out["effective_price"].astype(float)
+    min_total = float((prices * lot).sum())
+    if min_total > investment_pkr + 1e-6:
+        return None
+
+    shares = [float(lot)] * len(out)
+    invested = float(sum(s * p for s, p in zip(shares, prices, strict=True)))
+    remainder = investment_pkr - invested
+
+    weights = out["weight_pct"].astype(float)
+    w_sum = float(weights.sum())
+    if w_sum <= 0:
+        w_vals = [1.0 / len(out)] * len(out)
+    else:
+        w_vals = (weights / w_sum).tolist()
+
+    for i in range(len(out)):
+        price = float(prices.iloc[i])
+        extra_pkr = remainder * w_vals[i]
+        extra_lots = math.floor(extra_pkr / (price * lot))
+        if extra_lots > 0:
+            shares[i] += extra_lots * lot
+
+    out["shares"] = pd.Series(shares, index=out.index).astype(int)
+    return _redeploy_cash_to_weights(out, investment_pkr, use_board_lot)
+
+
+def _allocate_from_targets(
+    plan: pd.DataFrame,
+    investment_pkr: float,
+    use_board_lot: bool,
+) -> pd.DataFrame:
+    """target_pkr + weight_pct must already be set on plan."""
+    if _min_one_share_per_line_enabled(use_board_lot):
+        with_min = _try_minimum_one_share_allocation(
+            plan, investment_pkr, use_board_lot
+        )
+        if with_min is not None:
+            return with_min
+    out = plan.copy()
+    out["shares"] = _initial_share_counts(
+        out["target_pkr"], out["effective_price"], use_board_lot
+    )
+    return _redeploy_cash_to_weights(out, investment_pkr, use_board_lot)
+
+
 def _initial_share_counts(
     target_pkr: pd.Series, effective_price: pd.Series, use_board_lot: bool
 ) -> pd.Series:
@@ -6035,10 +6103,7 @@ def compute_sip_plan(
     plan["effective_price"] = plan["price"] * (1.0 + cost_buffer_pct / 100.0)
     plan["weight_pct"] = plan["idx_weight"] / total_weight * 100.0
     plan["target_pkr"] = investment_pkr * (plan["weight_pct"] / 100.0)
-    plan["shares"] = _initial_share_counts(
-        plan["target_pkr"], plan["effective_price"], use_board_lot
-    )
-    plan = _redeploy_cash_to_weights(plan, investment_pkr, use_board_lot)
+    plan = _allocate_from_targets(plan, investment_pkr, use_board_lot)
 
     plan["invested_pkr"] = plan["shares"] * plan["effective_price"]
     total_invested = plan["invested_pkr"].sum()
@@ -6075,10 +6140,7 @@ def compute_equal_held_topup_plan(
     n = len(plan)
     plan["weight_pct"] = 100.0 / n
     plan["target_pkr"] = investment_pkr / n
-    plan["shares"] = _initial_share_counts(
-        plan["target_pkr"], plan["effective_price"], use_board_lot
-    )
-    plan = _redeploy_cash_to_weights(plan, investment_pkr, use_board_lot)
+    plan = _allocate_from_targets(plan, investment_pkr, use_board_lot)
     return _finalize_plan_metrics(plan, investment_pkr)
 
 
@@ -6113,10 +6175,7 @@ def compute_benchmark_gap_topup_plan(
     else:
         live["target_pkr"] = investment_pkr * (live["idx_weight"] / total_w)
 
-    live["shares"] = _initial_share_counts(
-        live["target_pkr"], live["effective_price"], use_board_lot
-    )
-    live = _redeploy_cash_to_weights(live, investment_pkr, use_board_lot)
+    live = _allocate_from_targets(live, investment_pkr, use_board_lot)
     return _finalize_plan_metrics(live, investment_pkr)
 
 
@@ -6186,11 +6245,23 @@ def print_plan(
         )
 
     if not zero.empty:
+        lot = BOARD_LOT if use_board_lot else 1
+        need_min = float((plan["effective_price"] * lot).sum())
         print(
             f"\n{len(zero)} names still have zero shares "
             f"(could not reach even one {'lot' if use_board_lot else 'share'} "
             f"within your budget at buffered prices)."
         )
+        if _min_one_share_per_line_enabled(use_board_lot) and need_min > investment_pkr:
+            print(
+                f"  Minimum to buy 1× per line: PKR {need_min:,.2f} "
+                f"(your SIP: PKR {investment_pkr:,.2f}). "
+                "Raise the amount or drop a name for this month."
+            )
+        elif not use_board_lot and not _min_one_share_per_line_enabled(use_board_lot):
+            print(
+                "  Tip: set PSX_SIP_MIN_ONE_SHARE=1 for ≥1 share per line when affordable."
+            )
 
 
 def _utc_now_iso() -> str:
