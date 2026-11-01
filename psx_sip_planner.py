@@ -9,7 +9,7 @@ files you choose locally and fetches public PSX market data (see README).
 
 from __future__ import annotations
 
-__version__ = "1.4.8"
+__version__ = "1.4.9"
 __author__ = "Salim Ali Khan"
 __date__ = "October 2026"
 
@@ -2226,6 +2226,48 @@ def _screener_row(symbol: str) -> pd.Series | None:
     if hit.empty:
         return None
     return hit.iloc[0]
+
+
+def _map_prior_shares_to_basket(
+    prior: dict[str, int],
+    basket_symbols: set[str] | list[str],
+) -> tuple[dict[str, int], list[tuple[str, int, str]]]:
+    """
+    Map file symbols to basket lines (e.g. HUBC → HUBCXD). Returns merged prior for snapshots/top-up.
+    Third list: (file_symbol, qty, basket_symbol) aliases applied.
+    """
+    basket = sorted({str(s).upper() for s in basket_symbols})
+    merged: dict[str, int] = {}
+    aliases: list[tuple[str, int, str]] = []
+    unmapped: dict[str, int] = {}
+
+    for sym, qty in prior.items():
+        q = int(qty or 0)
+        if q <= 0:
+            continue
+        su = str(sym).upper()
+        target: str | None = None
+        for b in basket:
+            variants = {v.upper() for v in _related_equity_symbol_variants(b)}
+            if su in variants:
+                target = b
+                break
+        if target:
+            merged[target] = merged.get(target, 0) + q
+            if su != target:
+                aliases.append((su, q, target))
+        else:
+            unmapped[su] = unmapped.get(su, 0) + q
+
+    if aliases:
+        shown = ", ".join(f"{a}→{b} ({q})" for a, q, b in aliases[:8])
+        extra = f" … +{len(aliases) - 8} more" if len(aliases) > 8 else ""
+        print(
+            f"\n  Mapped broker/index tickers to basket lines: {shown}{extra}"
+        )
+    out = dict(merged)
+    out.update(unmapped)
+    return out, aliases
 
 
 def _related_equity_symbol_variants(symbol: str) -> list[str]:
@@ -7596,7 +7638,7 @@ def preview_saved_holdings_vs_basket(
     print(
         f"\n{'=' * 72}\n"
         f"  Saved holdings vs current basket — {os.path.basename(path)}\n"
-        f"  (Pick 1 = fresh monthly plan · 2 = top-up from these holdings)\n"
+        f"  (Pick 1 = this basket only · 2 = CSV then full basket / top-up / overlap)\n"
         f"{'=' * 72}"
     )
     report_holdings_alignment(
@@ -7619,11 +7661,12 @@ def choose_sip_mode(
     if sip_profile == "dividend_basket":
         print("\n  Your confirmed basket is ready.\n")
         print(
-            "  1. This basket only — monthly SIP across all names "
-            "(no CSV; optional skip symbols next)"
+            "  1. This basket only — SIP all names; you may load a CSV of "
+            "total shares held (e.g. HUBC:5) for the saved snapshot"
         )
         print(
-            "  2. Use a holdings/plan CSV — then choose full basket vs overlap vs top-up"
+            "  2. Use a holdings/plan CSV (total current shares) — then full basket / "
+            "top-up / overlap"
         )
     else:
         print("\nHow should this SIP run?\n")
@@ -7872,7 +7915,11 @@ def choose_topup_holdings_source(
     discovered = _discover_holdings_file_options(default_snapshot, source_id)
 
     while True:
-        print("\nLoad holdings for top-up:\n")
+        print(
+            "\nLoad holdings for top-up "
+            "(CSV = **total shares you hold now**; holdings snapshot with "
+            "shares_held is best):\n"
+        )
         if discovered:
             roots = _csv_search_directories()
             where = roots[0] if len(roots) == 1 else ", ".join(roots)
@@ -7983,9 +8030,11 @@ def choose_dividend_topup_allocation_mode(
         print(f"  In file only (not in basket): {', '.join(show)}{extra}")
     print(f"{'=' * 72}")
     print(
-        "\n  How should this month's SIP use the basket you just confirmed?\n"
+        "\n  Your file should list **total shares held now** (cumulative), "
+        "not only last month's buys.\n"
+        "  How should this month's SIP use the basket you just confirmed?\n"
         "  1. Full basket — invest across all basket names "
-        "(CSV kept for snapshot totals only; ignores orphan lines for allocation)\n"
+        "(CSV totals feed shares_held in snapshot; e.g. existing HUBC + new HUBCXD buys)\n"
         "  2. Top-up held lines — new cash toward basket weights among names you "
         "already hold in the basket\n"
         "  3. Overlap only — buy only symbols in BOTH your file and this basket"
@@ -8079,6 +8128,27 @@ def run_topup_from_prior_shares(
     return subset.reset_index(drop=True), prior_shares
 
 
+def prompt_optional_current_holdings_for_snapshot(
+    live_df: pd.DataFrame,
+    source_type: str,
+    source_id: str,
+    default_snapshot: str,
+) -> dict[str, int] | None:
+    """Optional cumulative positions before a fresh basket SIP (snapshot shares_held)."""
+    ans = prompt(
+        "\nLoad your current share totals from CSV? "
+        "(optional — cumulative, e.g. HUBC:5; maps to HUBCXD in basket) [y/N]: "
+    ).lower()
+    if ans not in ("y", "yes"):
+        return None
+    prior, _, _ = choose_topup_holdings_source(
+        default_snapshot, source_type, source_id
+    )
+    basket_syms = set(live_df["symbol"].astype(str).str.upper())
+    mapped, _aliases = _map_prior_shares_to_basket(prior, basket_syms)
+    return mapped if mapped else None
+
+
 def run_topup_flow(
     live_df: pd.DataFrame,
     source_type: str,
@@ -8090,6 +8160,8 @@ def run_topup_flow(
     prior, snap_header, snap_df = choose_topup_holdings_source(
         default_snapshot, source_type, source_id
     )
+    basket_syms = set(live_df["symbol"].astype(str).str.upper())
+    prior, _aliases = _map_prior_shares_to_basket(prior, basket_syms)
     live_alloc = live_df
     alloc_mode = "topup_held"
     if sip_profile == "dividend_basket":
@@ -8267,6 +8339,16 @@ def _run_benchmark_sip_flow(
         print(
             f"\n  Using your confirmed basket ({len(df)} names, target weights)."
         )
+        default_path = resolve_default_holdings_snapshot_path(source_id)
+        loaded = prompt_optional_current_holdings_for_snapshot(
+            df, source_type, source_id, default_path
+        )
+        if loaded:
+            prior_shares = loaded
+            print(
+                f"  Loaded {len(loaded)} symbol(s) — snapshot will add this month's "
+                "buys to those totals (shares_held)."
+            )
         valid = set(df["symbol"].astype(str))
         symbol_raw = prompt(
             "Skip any symbol this month? (comma-sep, blank = invest in all): "
